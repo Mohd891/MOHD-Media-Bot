@@ -23,7 +23,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 MAX_TELEGRAM_SIZE = 49 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_SIZE = 10 * 1024 * 1024
 PROGRESS_UPDATE_INTERVAL = 2.0
@@ -55,8 +54,7 @@ def get_host(url):
 
 def is_supported_url(url):
     host = get_host(url)
-    allowed = ("instagram.com", "tiktok.com", "x.com", "twitter.com")
-    return any(host == domain or host.endswith("." + domain) for domain in allowed)
+    return any(host == d or host.endswith("." + d) for d in ("instagram.com", "tiktok.com", "x.com", "twitter.com"))
 
 
 def is_tiktok_url(url):
@@ -83,64 +81,44 @@ def is_instagram_url(url):
 
 def run_ffmpeg(args, timeout=180):
     try:
-        return subprocess.run(
-            ["ffmpeg", "-y", *args],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-        )
+        return subprocess.run(["ffmpeg", "-y", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
     except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-        print(f"FFmpeg skipped: {exc!r}")
+        print(f"FFmpeg error: {exc!r}")
         return None
 
 
-def video_codecs(filename):
+def probe_streams(filename):
     try:
-        def probe(selector):
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", selector,
-                 "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(filename)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            values = (result.stdout or "").strip().splitlines()
-            return values[0] if values else ""
-        return probe("v:0"), probe("a:0")
-    except (FileNotFoundError, subprocess.SubprocessError, OSError):
-        return "", ""
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,width,height:stream_tags=rotate", "-of", "json", str(filename)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False,
+        )
+        return (json.loads(result.stdout or "{}").get("streams") or [])
+    except (ValueError, TypeError, json.JSONDecodeError, FileNotFoundError, subprocess.SubprocessError, OSError):
+        return []
+
+
+def video_codecs(filename):
+    streams = probe_streams(filename)
+    video = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"), "")
+    audio = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), "")
+    return video or "", audio or ""
 
 
 def video_dimensions(filename):
+    streams = probe_streams(filename)
+    stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if not stream:
+        return None
     try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height:stream_tags=rotate",
-                "-of", "json", str(filename),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        streams = (json.loads(result.stdout or "{}").get("streams") or [])
-        if not streams:
-            return None
-        stream = streams[0]
-        width = int(stream.get("width") or 0)
-        height = int(stream.get("height") or 0)
+        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
         if not width or not height:
             return None
         rotate = int(float((stream.get("tags") or {}).get("rotate") or 0)) % 360
         if rotate in (90, 270):
             width, height = height, width
         return width, height
-    except (ValueError, TypeError, json.JSONDecodeError, FileNotFoundError, subprocess.SubprocessError, OSError):
+    except (ValueError, TypeError):
         return None
 
 
@@ -148,10 +126,7 @@ def prepare_mp4_for_mobile(filename):
     if filename.suffix.lower() != ".mp4" or not filename.is_file():
         return filename
     optimized = filename.with_name(filename.stem + ".faststart.mp4")
-    result = run_ffmpeg([
-        "-threads", "1", "-i", str(filename), "-map", "0",
-        "-c", "copy", "-movflags", "+faststart", str(optimized)
-    ])
+    result = run_ffmpeg(["-threads", "1", "-i", str(filename), "-map", "0", "-c", "copy", "-movflags", "+faststart", str(optimized)])
     if result and result.returncode == 0 and optimized.is_file() and optimized.stat().st_size > 0:
         optimized.replace(filename)
     elif optimized.exists():
@@ -165,15 +140,11 @@ def make_instagram_mobile_compatible(filename):
     video_codec, audio_codec = video_codecs(filename)
     if video_codec == "h264" and audio_codec in ("", "aac"):
         return prepare_mp4_for_mobile(filename)
-
     compatible = filename.with_name(filename.stem + ".compatible.mp4")
     result = run_ffmpeg([
-        "-threads", "1", "-i", str(filename),
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-        "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
-        "-map_metadata", "-1", str(compatible)
+        "-threads", "1", "-i", str(filename), "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-map_metadata", "-1", str(compatible)
     ], timeout=300)
     if result and result.returncode == 0 and compatible.is_file() and compatible.stat().st_size > 0:
         compatible.replace(filename)
@@ -183,97 +154,55 @@ def make_instagram_mobile_compatible(filename):
     return prepare_mp4_for_mobile(filename)
 
 
-def find_downloaded_file(info, ydl, search_dir, prefix):
-    prepared = Path(ydl.prepare_filename(info))
-    candidates = [prepared]
-    if prepared.suffix.lower() != ".mp4":
-        candidates.append(prepared.with_suffix(".mp4"))
-    for extension in (".webm", ".mkv", ".mov"):
-        candidates.append(prepared.with_suffix(extension))
-    candidates.extend(
-        p for p in search_dir.glob(prefix + "*")
-        if p.is_file() and not p.name.endswith(".part")
-    )
+def locate_video_file(directory, prefix=""):
+    candidates = [p for p in directory.glob(f"{prefix}*") if p.is_file() and not p.name.endswith(".part")]
+    valid = []
+    for p in candidates:
+        video, audio = video_codecs(p)
+        if video:
+            valid.append((bool(audio), p.stat().st_size, p.stat().st_mtime, p))
+    if not valid:
+        return None
+    valid.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    return valid[0][3]
 
-    unique = []
-    seen = set()
-    for candidate in candidates:
-        if candidate.is_file() and candidate not in seen:
-            seen.add(candidate)
-            unique.append(candidate)
 
-    inspected = []
-    for candidate in unique:
-        video_codec, audio_codec = video_codecs(candidate)
-        if video_codec:
-            inspected.append((bool(audio_codec), candidate.stat().st_mtime, candidate))
-
-    if inspected:
-        inspected.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return inspected[0][2]
-    return None
+def locate_audio_file(directory):
+    candidates = []
+    for p in directory.glob("*"):
+        if not p.is_file() or p.name.endswith(".part"):
+            continue
+        video, audio = video_codecs(p)
+        if audio and not video:
+            candidates.append((p.stat().st_size, p.stat().st_mtime, p))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
 
 
 def mux_video_audio(video_path, audio_path, output_path):
     result = run_ffmpeg([
-        "-threads", "1",
-        "-i", str(video_path),
-        "-i", str(audio_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "48000",
-        "-ac", "2",
-        "-movflags", "+faststart",
-        str(output_path),
+        "-threads", "1", "-i", str(video_path), "-i", str(audio_path),
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(output_path)
     ], timeout=300)
-    if not result or result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
-        try:
-            output_path.unlink()
-        except OSError:
-            pass
-        return None
-    return output_path
-
-
-def recover_instagram_audio(job_dir, current_file):
-    _, audio_codec = video_codecs(current_file)
-    if audio_codec:
-        return current_file
-
-    video_candidates = []
-    audio_candidates = []
-    for candidate in job_dir.iterdir():
-        if not candidate.is_file() or candidate.name.endswith(".part"):
-            continue
-        vcodec, acodec = video_codecs(candidate)
-        if vcodec:
-            video_candidates.append(candidate)
-        if acodec:
-            audio_candidates.append(candidate)
-
-    if not video_candidates or not audio_candidates:
-        print("Instagram audio recovery: no separate video/audio pair found")
-        return current_file
-
-    video_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
-    audio_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
-    video_path = video_candidates[0]
-    audio_path = audio_candidates[0]
-    output_path = job_dir / "instagram_with_audio.mp4"
-    print(f"Instagram audio recovery: video={video_path.name} audio={audio_path.name}")
-    return mux_video_audio(video_path, audio_path, output_path) or current_file
+    if result and result.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path
+    try:
+        output_path.unlink()
+    except OSError:
+        pass
+    return None
 
 
 def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=None):
-    media_request = Request(media_url, headers={
+    req = Request(media_url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
         "Accept": accept,
     })
     try:
-        with urlopen(media_request, timeout=60) as response, filename.open("wb") as output:
+        with urlopen(req, timeout=60) as response, filename.open("wb") as output:
             total = int(response.headers.get("Content-Length") or 0)
             if max_size and total and total > max_size:
                 raise RuntimeError("Media file is larger than Telegram's upload limit")
@@ -286,12 +215,7 @@ def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=No
                 if max_size and downloaded > max_size:
                     raise RuntimeError("Media file is larger than Telegram's upload limit")
                 output.write(chunk)
-                set_progress(chat_id, {
-                    "stage": "download",
-                    "percent": downloaded / total * 100 if total else 0,
-                    "downloaded": downloaded,
-                    "total": total,
-                })
+                set_progress(chat_id, {"stage": "download", "percent": downloaded / total * 100 if total else 0, "downloaded": downloaded, "total": total})
     except Exception:
         try:
             filename.unlink()
@@ -305,10 +229,7 @@ def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=No
 
 def tikwm_payload(url):
     api_url = f"{TIKWM_API}?url={quote(url, safe='')}&hd=1"
-    req = Request(api_url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-    })
+    req = Request(api_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"})
     with urlopen(req, timeout=25) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if payload.get("code") != 0:
@@ -326,21 +247,15 @@ def download_tiktok_photo_post(url, chat_id):
     post_id = str(data.get("id") or "tiktok_photo")
     paths = []
     try:
-        for index, image_url in enumerate(images, start=1):
+        for index, image_url in enumerate(images, 1):
             filename = DOWNLOAD_DIR / f"{post_id}_{index:02d}.jpg"
-            download_direct_file(
-                image_url, filename, chat_id,
-                accept="image/avif,image/webp,image/jpeg,image/*,*/*;q=0.8",
-                max_size=MAX_TELEGRAM_PHOTO_SIZE,
-            )
+            download_direct_file(image_url, filename, chat_id, "image/avif,image/webp,image/jpeg,image/*,*/*;q=0.8", MAX_TELEGRAM_PHOTO_SIZE)
             paths.append(filename)
         return paths, data.get("title") or "TikTok Photo"
     except Exception:
-        for path in paths:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        for p in paths:
+            try: p.unlink()
+            except OSError: pass
         raise
 
 
@@ -351,17 +266,13 @@ def download_from_tikwm(url, chat_id):
         raise RuntimeError("TikWM returned no video URL")
     video_id = str(data.get("id") or "tiktok")
     filename = DOWNLOAD_DIR / f"{video_id}.mp4"
-    download_direct_file(media_url, filename, chat_id,
-                         accept="video/mp4,video/*,*/*;q=0.8", max_size=MAX_TELEGRAM_SIZE)
+    download_direct_file(media_url, filename, chat_id, "video/mp4,video/*,*/*;q=0.8", MAX_TELEGRAM_SIZE)
     return filename, data.get("title") or "TikTok Video"
 
 
 def download_from_ttdown(url, chat_id):
     api_url = f"{TIKTOK_API}?down={quote(url, safe='')}"
-    req = Request(api_url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-    })
+    req = Request(api_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"})
     with urlopen(req, timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
     media_url = payload.get("download_url")
@@ -369,73 +280,123 @@ def download_from_ttdown(url, chat_id):
         raise RuntimeError(payload.get("message") or payload.get("error") or "Second TikTok API returned no video URL")
     video_id = str(payload.get("video_id") or "tiktok")
     filename = DOWNLOAD_DIR / f"{video_id}.mp4"
-    download_direct_file(media_url, filename, chat_id,
-                         accept="video/mp4,video/*,*/*;q=0.8", max_size=MAX_TELEGRAM_SIZE)
+    download_direct_file(media_url, filename, chat_id, "video/mp4,video/*,*/*;q=0.8", MAX_TELEGRAM_SIZE)
     return filename, payload.get("title") or "TikTok Video"
 
 
-def download_video(url, chat_id):
-    def progress_hook(data):
+def download_instagram(url, chat_id, job_dir):
+    def hook(data):
         if data.get("status") == "downloading":
-            downloaded = data.get("downloaded_bytes", 0) or 0
+            done = data.get("downloaded_bytes", 0) or 0
             total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            set_progress(chat_id, {
-                "stage": "download", "percent": downloaded / total * 100 if total else 0,
-                "downloaded": downloaded, "total": total,
-                "speed": data.get("speed") or 0, "eta": data.get("eta"),
-            })
+            set_progress(chat_id, {"stage": "download", "percent": done / total * 100 if total else 0, "downloaded": done, "total": total, "speed": data.get("speed") or 0, "eta": data.get("eta")})
         elif data.get("status") == "finished":
             set_progress(chat_id, {"stage": "download_finished", "percent": 100})
 
-    is_instagram = is_instagram_url(url)
-    format_selector = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" if is_instagram else "b[ext=mp4]/b/bv*+ba"
+    video_dir = job_dir / "video"
+    video_dir.mkdir()
+    options = {
+        "outtmpl": str(video_dir / "video.%(id)s.%(ext)s"),
+        "format": "bv+ba/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "restrictfilenames": True,
+        "progress_hooks": [hook],
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = locate_video_file(video_dir, "video.")
+        if not filename:
+            raise RuntimeError("Downloaded Instagram video file not found")
+        print(f"Instagram initial file: {filename.name}; streams={video_codecs(filename)}")
+
+        _, audio_codec = video_codecs(filename)
+        if not audio_codec:
+            audio_dir = job_dir / "audio"
+            audio_dir.mkdir()
+            audio_options = {
+                "outtmpl": str(audio_dir / "audio.%(id)s.%(ext)s"),
+                "format": "ba/b",
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "restrictfilenames": True,
+                "socket_timeout": 30,
+                "retries": 2,
+                "fragment_retries": 2,
+            }
+            print("Instagram has no audio in video result; requesting audio-only fallback")
+            with yt_dlp.YoutubeDL(audio_options) as audio_ydl:
+                audio_info = audio_ydl.extract_info(url, download=True)
+            audio_file = locate_audio_file(audio_dir)
+            if audio_file:
+                recovered = mux_video_audio(filename, audio_file, job_dir / "instagram_with_audio.mp4")
+                if recovered:
+                    filename = recovered
+            else:
+                combined = locate_video_file(audio_dir, "audio.")
+                if combined and video_codecs(combined)[1]:
+                    filename = combined
+            print(f"Instagram after audio fallback: {filename.name}; streams={video_codecs(filename)}")
+
+        _, audio_codec = video_codecs(filename)
+        if not audio_codec:
+            raise RuntimeError("Instagram Reel was downloaded without an audio stream")
+        filename = make_instagram_mobile_compatible(filename)
+        _, audio_codec = video_codecs(filename)
+        if not audio_codec:
+            raise RuntimeError("Instagram Reel audio stream is missing after processing")
+        if filename.stat().st_size > MAX_TELEGRAM_SIZE:
+            raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
+        stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+        filename.replace(stable)
+        return stable, info.get("title") or "Instagram Reel"
+
+
+def download_video(url, chat_id):
+    if is_instagram_url(url):
+        job_dir = DOWNLOAD_DIR / f".job_{uuid4().hex}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            return download_instagram(url, chat_id, job_dir)
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+    def hook(data):
+        if data.get("status") == "downloading":
+            done = data.get("downloaded_bytes", 0) or 0
+            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+            set_progress(chat_id, {"stage": "download", "percent": done / total * 100 if total else 0, "downloaded": done, "total": total, "speed": data.get("speed") or 0, "eta": data.get("eta")})
+        elif data.get("status") == "finished":
+            set_progress(chat_id, {"stage": "download_finished", "percent": 100})
+
     job_dir = DOWNLOAD_DIR / f".job_{uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=True)
-    output_prefix = "media"
-
     try:
         options = {
-            "outtmpl": str(job_dir / f"{output_prefix}.%(id)s.%(ext)s"),
-            "format": format_selector,
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            "progress_hooks": [progress_hook],
-            "socket_timeout": 30,
-            "retries": 2,
-            "fragment_retries": 2,
+            "outtmpl": str(job_dir / "media.%(id)s.%(ext)s"),
+            "format": "b[ext=mp4]/b/bv*+ba",
+            "merge_output_format": "mp4", "noplaylist": True, "quiet": True, "no_warnings": True,
+            "restrictfilenames": True, "progress_hooks": [hook], "socket_timeout": 30, "retries": 2, "fragment_retries": 2,
         }
-
         if is_tiktok_url(url):
-            options["extractor_args"] = {"tiktok": {"app_info": [
-                "7355728856979392260", "7351149742343391009", "7351144126450059040"
-            ]}}
-
+            options["extractor_args"] = {"tiktok": {"app_info": ["7355728856979392260", "7351149742343391009", "7351144126450059040"]}}
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = find_downloaded_file(info, ydl, job_dir, output_prefix + ".")
+            filename = locate_video_file(job_dir, "media.")
             if not filename:
                 raise RuntimeError("Downloaded video file not found")
-
-            if is_instagram:
-                filename = recover_instagram_audio(job_dir, filename)
-                _, audio_codec = video_codecs(filename)
-                if not audio_codec:
-                    raise RuntimeError("Instagram Reel was downloaded without an audio stream")
-                filename = make_instagram_mobile_compatible(filename)
-                _, audio_codec = video_codecs(filename)
-                if not audio_codec:
-                    raise RuntimeError("Instagram Reel audio stream is missing after processing")
-
             if filename.stat().st_size > MAX_TELEGRAM_SIZE:
                 raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
-
-            stable_path = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
-            filename.replace(stable_path)
-            return stable_path, info.get("title") or "Video"
-
+            stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+            filename.replace(stable)
+            return stable, info.get("title") or "Video"
     except Exception as primary_error:
         if not is_tiktok_url(url):
             raise
@@ -459,11 +420,7 @@ async def update_status_message(message, stop_event):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎬 <b>MOHD MEDIA BOT</b>\n\nأرسل الرابط وسأتولى الباقي.\n\n"
-        "✅ Instagram / Reels\n✅ TikTok\n✅ X / Twitter\n\n"
-        "🚀 تحميل بأفضل جودة متاحة\n⚡ بدون ضغط تلقائي\n\n🔗 أرسل الرابط الآن.",
-        parse_mode="HTML")
+    await update.message.reply_text("🎬 <b>MOHD MEDIA BOT</b>\n\nأرسل الرابط وسأتولى الباقي.\n\n✅ Instagram / Reels\n✅ TikTok\n✅ X / Twitter\n\n🚀 تحميل بأفضل جودة متاحة\n⚡ بدون ضغط تلقائي\n\n🔗 أرسل الرابط الآن.", parse_mode="HTML")
 
 
 async def send_photo_album(message, paths, title):
@@ -520,7 +477,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = await asyncio.to_thread(download_video, url, chat_id)
         stop_event.set()
         await progress_task
-
         if isinstance(result[0], list):
             paths, title = result
             if not paths:
@@ -533,23 +489,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise RuntimeError("Downloaded file is missing")
         if filename.stat().st_size > MAX_TELEGRAM_SIZE:
             raise RuntimeError("❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB).")
-
         dimensions = video_dimensions(filename)
+        width, height = dimensions if dimensions else (None, None)
         if dimensions:
-            width, height = dimensions
             print(f"Sending video dimensions: {width}x{height}")
-        else:
-            width = height = None
-
         with filename.open("rb") as video:
-            await update.message.reply_video(
-                video=video,
-                caption=f"🎬 {title[:900]}",
-                width=width,
-                height=height,
-                supports_streaming=True,
-            )
-
+            await update.message.reply_video(video=video, caption=f"🎬 {title[:900]}", width=width, height=height, supports_streaming=True)
     except Exception as exc:
         stop_event.set()
         try:
@@ -630,10 +575,8 @@ def health():
 
 @app.post(f"/{WEBHOOK_PATH}")
 def webhook():
-    if WEBHOOK_SECRET:
-        provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if provided_secret != WEBHOOK_SECRET:
-            return jsonify({"ok": False}), 403
+    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
+        return jsonify({"ok": False}), 403
     try:
         data = request.get_json(force=True, silent=False)
         update = Update.de_json(data, telegram_application.bot)
