@@ -27,8 +27,9 @@ MAX_TELEGRAM_SIZE = 49 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_SIZE = 10 * 1024 * 1024
 PROGRESS_UPDATE_INTERVAL = 2.0
 DOWNLOAD_CONCURRENCY = 1
-TIKWM_API = "https://tikwm.com/api/"
+TIKWM_API = "https://www.tikwm.com/api/"
 TIKTOK_API = "https://tdownv4.sl-bjs.workers.dev/"
+REELGRAB_API = "https://grabsocial.org/api/download"
 
 progress_data = {}
 progress_lock = threading.Lock()
@@ -65,8 +66,8 @@ def is_tiktok_url(url):
 def is_tiktok_photo_url(url):
     if not is_tiktok_url(url):
         return False
-    path = urlparse(url).path.lower().rstrip("/")
-    return bool(re.search(r"/photo(?:/|$)", path))
+    path = urlparse(url).path.lower()
+    return "/photo/" in path or path.endswith("/photo")
 
 
 def clean_tiktok_photo_url(url):
@@ -89,11 +90,8 @@ def run_ffmpeg(args, timeout=180):
 
 def probe_streams(filename):
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,width,height:stream_tags=rotate", "-of", "json", str(filename)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False,
-        )
-        return (json.loads(result.stdout or "{}").get("streams") or [])
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,width,height:stream_tags=rotate", "-of", "json", str(filename)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False)
+        return json.loads(result.stdout or "{}").get("streams") or []
     except (ValueError, TypeError, json.JSONDecodeError, FileNotFoundError, subprocess.SubprocessError, OSError):
         return []
 
@@ -111,7 +109,8 @@ def video_dimensions(filename):
     if not stream:
         return None
     try:
-        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
         if not width or not height:
             return None
         rotate = int(float((stream.get("tags") or {}).get("rotate") or 0)) % 360
@@ -141,11 +140,7 @@ def make_instagram_mobile_compatible(filename):
     if video_codec == "h264" and audio_codec in ("", "aac"):
         return prepare_mp4_for_mobile(filename)
     compatible = filename.with_name(filename.stem + ".compatible.mp4")
-    result = run_ffmpeg([
-        "-threads", "1", "-i", str(filename), "-map", "0:v:0", "-map", "0:a:0?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-map_metadata", "-1", str(compatible)
-    ], timeout=300)
+    result = run_ffmpeg(["-threads", "1", "-i", str(filename), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-map_metadata", "-1", str(compatible)], timeout=300)
     if result and result.returncode == 0 and compatible.is_file() and compatible.stat().st_size > 0:
         compatible.replace(filename)
         return filename
@@ -182,11 +177,7 @@ def locate_audio_file(directory):
 
 
 def mux_video_audio(video_path, audio_path, output_path):
-    result = run_ffmpeg([
-        "-threads", "1", "-i", str(video_path), "-i", str(audio_path),
-        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(output_path)
-    ], timeout=300)
+    result = run_ffmpeg(["-threads", "1", "-i", str(video_path), "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(output_path)], timeout=300)
     if result and result.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
         return output_path
     try:
@@ -197,10 +188,7 @@ def mux_video_audio(video_path, audio_path, output_path):
 
 
 def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=None):
-    req = Request(media_url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-        "Accept": accept,
-    })
+    req = Request(media_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36", "Accept": accept})
     try:
         with urlopen(req, timeout=60) as response, filename.open("wb") as output:
             total = int(response.headers.get("Content-Length") or 0)
@@ -229,12 +217,26 @@ def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=No
 
 def tikwm_payload(url):
     api_url = f"{TIKWM_API}?url={quote(url, safe='')}&hd=1"
-    req = Request(api_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"})
+    req = Request(api_url, headers={"User-Agent": "Mozilla/5.0 (iPad; U; CPU OS 3_2 like Mac OS X; en-us) AppleWebKit/531.21.10 (KHTML, like Gecko) Version/4.0.4 Mobile/7B334b Safari/531.21.10", "Accept": "application/json,text/plain,*/*", "Referer": "https://www.tikwm.com/"})
     with urlopen(req, timeout=25) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if payload.get("code") != 0:
         raise RuntimeError(f"TikWM error: {payload.get('msg') or 'unknown error'}")
     return payload.get("data") or {}
+
+
+def resolve_redirect_url(url):
+    if get_host(url) not in ("vt.tiktok.com", "vm.tiktok.com", "m.tiktok.com", "www.tiktok.com"):
+        return url
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
+        with urlopen(req, timeout=12) as response:
+            final_url = response.geturl()
+        print(f"TikTok redirect: {url} -> {final_url}")
+        return final_url or url
+    except Exception as exc:
+        print(f"TikTok redirect resolve failed: {exc!r}")
+        return url
 
 
 def download_tiktok_photo_post(url, chat_id):
@@ -254,13 +256,18 @@ def download_tiktok_photo_post(url, chat_id):
         return paths, data.get("title") or "TikTok Photo"
     except Exception:
         for p in paths:
-            try: p.unlink()
-            except OSError: pass
+            try:
+                p.unlink()
+            except OSError:
+                pass
         raise
 
 
 def download_from_tikwm(url, chat_id):
     data = tikwm_payload(url)
+    images = data.get("images") or []
+    if images:
+        raise RuntimeError("TikWM returned a photo post; use photo mode")
     media_url = data.get("hdplay") or data.get("play")
     if not media_url:
         raise RuntimeError("TikWM returned no video URL")
@@ -284,6 +291,37 @@ def download_from_ttdown(url, chat_id):
     return filename, payload.get("title") or "TikTok Video"
 
 
+def download_from_reelgrab(url, chat_id):
+    req = Request(REELGRAB_API, data=json.dumps({"url": url}).encode("utf-8"), headers={"User-Agent": "MOHD-Media-Bot/1.0", "Accept": "application/json", "Content-Type": "application/json"}, method="POST")
+    with urlopen(req, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("success"):
+        raise RuntimeError(payload.get("message") or payload.get("error") or "ReelGrab could not resolve the media")
+    links = payload.get("downloadLinks") or payload.get("download_links") or []
+    video_url = None
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        fmt = str(item.get("format") or item.get("type") or "").lower()
+        candidate = item.get("url") or item.get("downloadUrl")
+        if candidate and ("mp4" in fmt or "video" in fmt):
+            video_url = candidate
+            break
+    if not video_url:
+        for item in links:
+            if isinstance(item, dict) and (item.get("url") or item.get("downloadUrl")):
+                video_url = item.get("url") or item.get("downloadUrl")
+                break
+    if not video_url:
+        raise RuntimeError("ReelGrab returned no video download link")
+    filename = DOWNLOAD_DIR / f"reelgrab_{uuid4().hex}.mp4"
+    download_direct_file(video_url, filename, chat_id, "video/mp4,video/*,*/*;q=0.8", MAX_TELEGRAM_SIZE)
+    if not video_codecs(filename)[1]:
+        filename.unlink(missing_ok=True)
+        raise RuntimeError("ReelGrab returned a video without audio")
+    return filename, payload.get("title") or "Instagram Video"
+
+
 def download_instagram(url, chat_id, job_dir):
     def hook(data):
         if data.get("status") == "downloading":
@@ -295,68 +333,70 @@ def download_instagram(url, chat_id, job_dir):
 
     video_dir = job_dir / "video"
     video_dir.mkdir()
-    options = {
-        "outtmpl": str(video_dir / "video.%(id)s.%(ext)s"),
-        "format": "bv+ba/b",
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-        "progress_hooks": [hook],
-        "socket_timeout": 30,
-        "retries": 2,
-        "fragment_retries": 2,
-    }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+    options = {"outtmpl": str(video_dir / "video.%(id)s.%(ext)s"), "format": "bv+ba/b", "merge_output_format": "mp4", "noplaylist": True, "quiet": True, "no_warnings": True, "restrictfilenames": True, "progress_hooks": [hook], "socket_timeout": 30, "retries": 2, "fragment_retries": 2}
+    primary_error = None
+    filename = None
+    info = None
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
         filename = locate_video_file(video_dir, "video.")
-        if not filename:
-            raise RuntimeError("Downloaded Instagram video file not found")
+    except Exception as exc:
+        primary_error = exc
+        print(f"Instagram yt-dlp primary failed: {exc!r}")
+
+    if filename:
         print(f"Instagram initial file: {filename.name}; streams={video_codecs(filename)}")
+        _, audio_codec = video_codecs(filename)
+        if audio_codec:
+            filename = make_instagram_mobile_compatible(filename)
+        else:
+            print("Instagram has no audio in video result; trying external resolver")
+            try:
+                fallback_file, fallback_title = download_from_reelgrab(url, chat_id)
+                print(f"Instagram ReelGrab result: {fallback_file.name}; streams={video_codecs(fallback_file)}")
+                if video_codecs(fallback_file)[1]:
+                    filename.unlink(missing_ok=True)
+                    filename = fallback_file
+                    info = info or {}
+                    info["title"] = info.get("title") or fallback_title
+                else:
+                    fallback_file.unlink(missing_ok=True)
+            except Exception as fallback_error:
+                print(f"Instagram ReelGrab fallback failed: {fallback_error!r}")
 
         _, audio_codec = video_codecs(filename)
         if not audio_codec:
             audio_dir = job_dir / "audio"
             audio_dir.mkdir()
-            audio_options = {
-                "outtmpl": str(audio_dir / "audio.%(id)s.%(ext)s"),
-                "format": "ba/b",
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "restrictfilenames": True,
-                "socket_timeout": 30,
-                "retries": 2,
-                "fragment_retries": 2,
-            }
-            print("Instagram has no audio in video result; requesting audio-only fallback")
-            with yt_dlp.YoutubeDL(audio_options) as audio_ydl:
-                audio_info = audio_ydl.extract_info(url, download=True)
-            audio_file = locate_audio_file(audio_dir)
-            if audio_file:
-                recovered = mux_video_audio(filename, audio_file, job_dir / "instagram_with_audio.mp4")
-                if recovered:
-                    filename = recovered
-            else:
-                combined = locate_video_file(audio_dir, "audio.")
-                if combined and video_codecs(combined)[1]:
-                    filename = combined
-            print(f"Instagram after audio fallback: {filename.name}; streams={video_codecs(filename)}")
+            audio_options = {"outtmpl": str(audio_dir / "audio.%(id)s.%(ext)s"), "format": "ba/b", "noplaylist": True, "quiet": True, "no_warnings": True, "restrictfilenames": True, "socket_timeout": 30, "retries": 2, "fragment_retries": 2}
+            try:
+                print("Instagram still has no audio; requesting yt-dlp audio-only fallback")
+                with yt_dlp.YoutubeDL(audio_options) as audio_ydl:
+                    audio_ydl.extract_info(url, download=True)
+                audio_file = locate_audio_file(audio_dir)
+                if audio_file:
+                    recovered = mux_video_audio(filename, audio_file, job_dir / "instagram_with_audio.mp4")
+                    if recovered:
+                        filename = recovered
+            except Exception as audio_error:
+                print(f"Instagram audio-only fallback failed: {audio_error!r}")
 
-        _, audio_codec = video_codecs(filename)
-        if not audio_codec:
+        if not video_codecs(filename)[1]:
             raise RuntimeError("Instagram Reel was downloaded without an audio stream")
-        filename = make_instagram_mobile_compatible(filename)
-        _, audio_codec = video_codecs(filename)
-        if not audio_codec:
-            raise RuntimeError("Instagram Reel audio stream is missing after processing")
-        if filename.stat().st_size > MAX_TELEGRAM_SIZE:
-            raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
-        stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
-        filename.replace(stable)
-        return stable, info.get("title") or "Instagram Reel"
+    else:
+        print(f"Instagram has no usable yt-dlp video; trying ReelGrab: {primary_error!r}")
+        filename, fallback_title = download_from_reelgrab(url, chat_id)
+        info = {"title": fallback_title}
+
+    filename = make_instagram_mobile_compatible(filename)
+    if not video_codecs(filename)[1]:
+        raise RuntimeError("Instagram Reel audio stream is missing after processing")
+    if filename.stat().st_size > MAX_TELEGRAM_SIZE:
+        raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
+    stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+    filename.replace(stable)
+    return stable, (info or {}).get("title") or "Instagram Reel"
 
 
 def download_video(url, chat_id):
@@ -379,12 +419,7 @@ def download_video(url, chat_id):
     job_dir = DOWNLOAD_DIR / f".job_{uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=True)
     try:
-        options = {
-            "outtmpl": str(job_dir / "media.%(id)s.%(ext)s"),
-            "format": "b[ext=mp4]/b/bv*+ba",
-            "merge_output_format": "mp4", "noplaylist": True, "quiet": True, "no_warnings": True,
-            "restrictfilenames": True, "progress_hooks": [hook], "socket_timeout": 30, "retries": 2, "fragment_retries": 2,
-        }
+        options = {"outtmpl": str(job_dir / "media.%(id)s.%(ext)s"), "format": "b[ext=mp4]/b/bv*+ba", "merge_output_format": "mp4", "noplaylist": True, "quiet": True, "no_warnings": True, "restrictfilenames": True, "progress_hooks": [hook], "socket_timeout": 30, "retries": 2, "fragment_retries": 2}
         if is_tiktok_url(url):
             options["extractor_args"] = {"tiktok": {"app_info": ["7355728856979392260", "7351149742343391009", "7351144126450059040"]}}
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -462,6 +497,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هذا الموقع غير مدعوم حاليًا.\n\nالمواقع المدعومة:\n• Instagram\n• TikTok\n• X / Twitter")
         return
 
+    if is_tiktok_url(url):
+        expanded_url = await asyncio.to_thread(resolve_redirect_url, url)
+        if expanded_url and is_supported_url(expanded_url):
+            url = expanded_url
+
     chat_id = update.effective_chat.id
     status_message = await update.message.reply_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
     stop_event = threading.Event()
@@ -483,7 +523,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise RuntimeError("No images were downloaded")
             await send_photo_album(update.message, paths, title)
             return
-
         filename, title = result
         if not filename or not filename.is_file():
             raise RuntimeError("Downloaded file is missing")
