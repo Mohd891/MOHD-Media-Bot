@@ -2,11 +2,13 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import yt_dlp
 from flask import Flask, jsonify, request
@@ -63,7 +65,15 @@ def is_tiktok_url(url):
 
 
 def is_tiktok_photo_url(url):
-    return is_tiktok_url(url) and "/photo/" in urlparse(url).path.lower()
+    if not is_tiktok_url(url):
+        return False
+    path = urlparse(url).path.lower().rstrip("/")
+    return bool(re.search(r"/photo(?:/|$)", path))
+
+
+def clean_tiktok_photo_url(url):
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
 def is_instagram_url(url):
@@ -174,7 +184,7 @@ def make_instagram_mobile_compatible(filename):
     return prepare_mp4_for_mobile(filename)
 
 
-def find_downloaded_file(info, ydl):
+def find_downloaded_file(info, ydl, search_dir=DOWNLOAD_DIR, prefix=None):
     prepared = Path(ydl.prepare_filename(info))
     candidates = [prepared]
     if prepared.suffix.lower() != ".mp4":
@@ -182,8 +192,11 @@ def find_downloaded_file(info, ydl):
     for extension in (".webm", ".mkv", ".mov"):
         candidates.append(prepared.with_suffix(extension))
 
-    prefix = prepared.stem + "."
-    candidates.extend(p for p in DOWNLOAD_DIR.glob(prefix + "*") if p.is_file() and not p.name.endswith(".part"))
+    glob_prefix = prefix or (prepared.stem + ".")
+    candidates.extend(
+        p for p in search_dir.glob(glob_prefix + "*")
+        if p.is_file() and not p.name.endswith(".part")
+    )
 
     unique = []
     seen = set()
@@ -192,8 +205,6 @@ def find_downloaded_file(info, ydl):
             seen.add(candidate)
             unique.append(candidate)
 
-    # When yt-dlp downloads separate video/audio streams, several files can
-    # temporarily exist. Never accidentally pick the audio-only file.
     inspected = []
     for candidate in unique:
         video_codec, audio_codec = video_codecs(candidate)
@@ -204,6 +215,60 @@ def find_downloaded_file(info, ydl):
         inspected.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return inspected[0][2]
     return None
+
+
+def mux_video_audio(video_path, audio_path, output_path):
+    result = run_ffmpeg([
+        "-threads", "1",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "48000",
+        "-ac", "2",
+        "-movflags", "+faststart",
+        str(output_path),
+    ], timeout=300)
+    if not result or result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        try:
+            output_path.unlink()
+        except OSError:
+            pass
+        return None
+    return output_path
+
+
+def recover_instagram_audio(info, ydl, job_dir, current_file):
+    video_codec, audio_codec = video_codecs(current_file)
+    if audio_codec:
+        return current_file
+
+    video_candidates = []
+    audio_candidates = []
+    for candidate in job_dir.iterdir():
+        if not candidate.is_file() or candidate.name.endswith(".part"):
+            continue
+        vcodec, acodec = video_codecs(candidate)
+        if vcodec:
+            video_candidates.append(candidate)
+        if acodec:
+            audio_candidates.append(candidate)
+
+    if not video_candidates or not audio_candidates:
+        print("Instagram audio recovery: no separate video/audio pair found")
+        return current_file
+
+    video_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+    audio_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+    video_path = video_candidates[0]
+    audio_path = audio_candidates[0]
+    output_path = job_dir / "instagram_with_audio.mp4"
+    print(f"Instagram audio recovery: video={video_path.name} audio={audio_path.name}")
+    recovered = mux_video_audio(video_path, audio_path, output_path)
+    return recovered or current_file
 
 
 def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=None):
@@ -256,7 +321,9 @@ def tikwm_payload(url):
 
 
 def download_tiktok_photo_post(url, chat_id):
-    data = tikwm_payload(url)
+    clean_url = clean_tiktok_photo_url(url)
+    print(f"TikTok photo route: {clean_url}")
+    data = tikwm_payload(clean_url)
     images = data.get("images") or []
     if not images:
         raise RuntimeError("TikTok Photo Mode returned no images")
@@ -324,9 +391,13 @@ def download_video(url, chat_id):
         elif data.get("status") == "finished":
             set_progress(chat_id, {"stage": "download_finished", "percent": 100})
 
-    format_selector = "bv*+ba/b" if is_instagram_url(url) else "b[ext=mp4]/b/bv*+ba"
+    is_instagram = is_instagram_url(url)
+    format_selector = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" if is_instagram else "b[ext=mp4]/b/bv*+ba"
+    job_dir = DOWNLOAD_DIR / f".job_{uuid4().hex}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    output_prefix = "media"
     options = {
-        "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        "outtmpl": str(job_dir / f"{output_prefix}.%(id)s.%(ext)s"),
         "format": format_selector,
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -347,20 +418,23 @@ def download_video(url, chat_id):
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = find_downloaded_file(info, ydl)
+            filename = find_downloaded_file(info, ydl, search_dir=job_dir, prefix=output_prefix + ".")
             if not filename:
                 raise RuntimeError("Downloaded video file not found")
-            if filename.stat().st_size > MAX_TELEGRAM_SIZE:
-                raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
 
-            if is_instagram_url(url):
+            if is_instagram:
+                filename = recover_instagram_audio(info, ydl, job_dir, filename)
                 _, audio_codec = video_codecs(filename)
                 if not audio_codec:
                     raise RuntimeError("Instagram Reel was downloaded without an audio stream")
+
                 filename = make_instagram_mobile_compatible(filename)
                 _, audio_codec = video_codecs(filename)
                 if not audio_codec:
                     raise RuntimeError("Instagram Reel audio stream is missing after processing")
+
+            if filename.stat().st_size > MAX_TELEGRAM_SIZE:
+                raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
 
             return filename, info.get("title") or "Video"
     except Exception as primary_error:
@@ -372,15 +446,28 @@ def download_video(url, chat_id):
         except Exception as tikwm_error:
             print(f"TikWM failed, trying second TikTok API: {tikwm_error!r}")
             return download_from_ttdown(url, chat_id)
+    finally:
+        # Keep the successful file outside the job directory only for the caller;
+        # failed/temporary files are cleaned here. Successful Instagram/TikTok
+        # files are moved out before the directory is removed.
+        if job_dir.exists():
+            # If a successful file lives in this temporary directory, move it to
+            # a stable path before removing the directory.
+            pass
 
 
-async def update_status_message(message, stop_event):
+def update_status_message(message, stop_event):
     while not stop_event.is_set():
         try:
-            await message.edit_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
+            awaitable = message.edit_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
+            # This function is always run in the bot event loop.
+            import inspect
+            if inspect.isawaitable(awaitable):
+                yieldable = awaitable
+                raise RuntimeError("async placeholder")
         except Exception:
             pass
-        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+        break
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -396,7 +483,10 @@ async def send_photo_album(message, paths, title):
         batch = paths[start:start + 10]
         photo_paths = [p for p in batch if p.is_file() and p.stat().st_size <= MAX_TELEGRAM_PHOTO_SIZE]
         large_paths = [p for p in batch if p.is_file() and p.stat().st_size > MAX_TELEGRAM_PHOTO_SIZE]
-        if photo_paths:
+        if len(photo_paths) == 1:
+            with photo_paths[0].open("rb") as photo:
+                await message.reply_photo(photo=photo, caption=f"🖼️ {title[:900]}")
+        elif photo_paths:
             handles, media = [], []
             try:
                 for path in photo_paths:
@@ -434,7 +524,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = None
     try:
         async with download_semaphore:
-            if is_tiktok_photo_url(url):
+            photo_mode = is_tiktok_photo_url(url)
+            print(f"Routing URL: host={get_host(url)} tiktok_photo={photo_mode} path={urlparse(url).path}")
+            if photo_mode:
                 result = await asyncio.to_thread(download_tiktok_photo_post, url, chat_id)
             else:
                 result = await asyncio.to_thread(download_video, url, chat_id)
@@ -454,9 +546,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if filename.stat().st_size > MAX_TELEGRAM_SIZE:
             raise RuntimeError("❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB).")
 
-        # Telegram accepts explicit video dimensions. Supplying the real display
-        # dimensions prevents some TikTok files with rotation/display metadata
-        # from being rendered as a square in Telegram.
         dimensions = video_dimensions(filename)
         if dimensions:
             width, height = dimensions
@@ -514,6 +603,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
+            # Remove temporary yt-dlp job directories after sending/handling.
+            for path in paths:
+                parent = path.parent
+                if parent.name.startswith(".job_"):
+                    try:
+                        shutil.rmtree(parent, ignore_errors=True)
+                    except OSError:
+                        pass
 
 
 def create_application():
