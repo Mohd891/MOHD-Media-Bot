@@ -258,8 +258,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 supports_streaming=True,
             )
         await status_message.edit_text(
-            "✅ <b>تم التحميل والإرسال بنجاح</b>\n\n"
-            f"📦 الحجم: {format_bytes(file_size)}",
+            "✅ <b>تم التحميل والإرسال بنجاح</b>",
             parse_mode="HTML",
         )
     except Exception as exc:
