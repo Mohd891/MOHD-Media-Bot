@@ -81,8 +81,7 @@ def run_ffmpeg(args, timeout=180):
         return subprocess.run(
             ["ffmpeg", "-y", *args],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
+            stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
         )
@@ -114,30 +113,16 @@ def prepare_mp4_for_mobile(filename):
 def video_codecs(filename):
     try:
         result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=nw=1:nk=1", str(filename),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=20,
-            check=False,
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(filename)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False,
         )
         video = (result.stdout or "").strip().splitlines()
 
         result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=nw=1:nk=1", str(filename),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=20,
-            check=False,
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(filename)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False,
         )
         audio = (result.stdout or "").strip().splitlines()
         return (video[0] if video else ""), (audio[0] if audio else "")
@@ -153,7 +138,6 @@ def make_instagram_mobile_compatible(filename):
     if video_codec == "h264" and audio_codec in ("", "aac"):
         return prepare_mp4_for_mobile(filename)
 
-    # Only transcode when the source codecs are not Telegram/mobile-friendly.
     compatible = filename.with_name(filename.stem + ".compatible.mp4")
     result = run_ffmpeg([
         "-threads", "1",
@@ -193,10 +177,7 @@ def find_downloaded_file(info, ydl):
 
     prefix = prepared.stem + "."
     matches = sorted(
-        (
-            p for p in DOWNLOAD_DIR.glob(prefix + "*")
-            if p.is_file() and not p.name.endswith(".part")
-        ),
+        (p for p in DOWNLOAD_DIR.glob(prefix + "*") if p.is_file() and not p.name.endswith(".part")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -211,7 +192,6 @@ def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=No
             "Accept": accept,
         },
     )
-
     try:
         with urlopen(media_request, timeout=60) as response, filename.open("wb") as output:
             total = int(response.headers.get("Content-Length") or 0)
@@ -247,13 +227,10 @@ def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=No
 
 def tikwm_payload(url):
     api_url = f"{TIKWM_API}?url={quote(url, safe='')}&hd=1"
-    req = Request(
-        api_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
+    req = Request(api_url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    })
     with urlopen(req, timeout=25) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if payload.get("code") != 0:
@@ -273,9 +250,7 @@ def download_tiktok_photo_post(url, chat_id):
         for index, image_url in enumerate(images, start=1):
             filename = DOWNLOAD_DIR / f"{post_id}_{index:02d}.jpg"
             download_direct_file(
-                image_url,
-                filename,
-                chat_id,
+                image_url, filename, chat_id,
                 accept="image/avif,image/webp,image/jpeg,image/*,*/*;q=0.8",
                 max_size=MAX_TELEGRAM_PHOTO_SIZE,
             )
@@ -298,47 +273,30 @@ def download_from_tikwm(url, chat_id):
 
     video_id = str(data.get("id") or "tiktok")
     filename = DOWNLOAD_DIR / f"{video_id}.mp4"
-    download_direct_file(
-        media_url,
-        filename,
-        chat_id,
-        accept="video/mp4,video/*,*/*;q=0.8",
-        max_size=MAX_TELEGRAM_SIZE,
-    )
-    # Avoid FFmpeg here: the API already returns an MP4 and stream-copying it
-    # creates a second full file unnecessarily on a 512 MB instance.
+    download_direct_file(media_url, filename, chat_id,
+                         accept="video/mp4,video/*,*/*;q=0.8",
+                         max_size=MAX_TELEGRAM_SIZE)
     return filename, data.get("title") or "TikTok Video"
 
 
 def download_from_ttdown(url, chat_id):
     api_url = f"{TIKTOK_API}?down={quote(url, safe='')}"
-    req = Request(
-        api_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
+    req = Request(api_url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    })
     with urlopen(req, timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
 
     media_url = payload.get("download_url")
     if not media_url:
-        raise RuntimeError(
-            payload.get("message")
-            or payload.get("error")
-            or "Second TikTok API returned no video URL"
-        )
+        raise RuntimeError(payload.get("message") or payload.get("error") or "Second TikTok API returned no video URL")
 
     video_id = str(payload.get("video_id") or "tiktok")
     filename = DOWNLOAD_DIR / f"{video_id}.mp4"
-    download_direct_file(
-        media_url,
-        filename,
-        chat_id,
-        accept="video/mp4,video/*,*/*;q=0.8",
-        max_size=MAX_TELEGRAM_SIZE,
-    )
+    download_direct_file(media_url, filename, chat_id,
+                         accept="video/mp4,video/*,*/*;q=0.8",
+                         max_size=MAX_TELEGRAM_SIZE)
     return filename, payload.get("title") or "TikTok Video"
 
 
@@ -359,11 +317,13 @@ def download_video(url, chat_id):
         elif status == "finished":
             set_progress(chat_id, {"stage": "download_finished", "percent": 100})
 
-    # Prefer a single MP4 stream. This avoids the extra video+audio merge step
-    # used by bv*+ba and significantly reduces temporary disk/memory pressure.
+    # IMPORTANT: never use best[ext=mp4] here. That can choose a video-only
+    # MP4 and produce a Reel with no sound. Prefer a combined A/V stream;
+    # otherwise download best video + best audio and merge with FFmpeg.
     options = {
         "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
+        "format": "b[ext=mp4]/b/bv*+ba",
+        "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -395,7 +355,12 @@ def download_video(url, chat_id):
             if filename.stat().st_size > MAX_TELEGRAM_SIZE:
                 raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
 
+            # Safety check: if a Reel somehow came back without an audio
+            # stream, fail instead of silently sending a silent video.
             if is_instagram_url(url):
+                _, audio_codec = video_codecs(filename)
+                if not audio_codec:
+                    raise RuntimeError("Instagram Reel was downloaded without an audio stream")
                 filename = make_instagram_mobile_compatible(filename)
 
             return filename, info.get("title") or "Video"
@@ -414,10 +379,7 @@ def download_video(url, chat_id):
 async def update_status_message(message, stop_event):
     while not stop_event.is_set():
         try:
-            await message.edit_text(
-                "⏳ <b>جاري معالجة الرابط...</b>",
-                parse_mode="HTML",
-            )
+            await message.edit_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
         except Exception:
             pass
         await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
@@ -432,22 +394,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ X / Twitter\n\n"
         "🚀 تحميل بأفضل جودة متاحة\n"
         "⚡ بدون ضغط تلقائي\n\n"
-        "🔗 أرسل الرابط الآن.",
-        parse_mode="HTML",
-    )
+        "🔗 أرسل الرابط الآن.", parse_mode="HTML")
 
 
 async def send_photo_album(message, paths, title):
     for start in range(0, len(paths), 10):
         batch = paths[start:start + 10]
-        photo_paths = [
-            p for p in batch
-            if p.is_file() and p.stat().st_size <= MAX_TELEGRAM_PHOTO_SIZE
-        ]
-        large_paths = [
-            p for p in batch
-            if p.is_file() and p.stat().st_size > MAX_TELEGRAM_PHOTO_SIZE
-        ]
+        photo_paths = [p for p in batch if p.is_file() and p.stat().st_size <= MAX_TELEGRAM_PHOTO_SIZE]
+        large_paths = [p for p in batch if p.is_file() and p.stat().st_size > MAX_TELEGRAM_PHOTO_SIZE]
 
         if photo_paths:
             handles = []
@@ -466,10 +420,7 @@ async def send_photo_album(message, paths, title):
 
         for path in large_paths:
             with path.open("rb") as photo:
-                await message.reply_document(
-                    document=photo,
-                    caption="🖼️ صورة من TikTok Photo Mode",
-                )
+                await message.reply_document(document=photo, caption="🖼️ صورة من TikTok Photo Mode")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -486,30 +437,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_supported_url(url):
         await update.message.reply_text(
             "❌ هذا الموقع غير مدعوم حاليًا.\n\n"
-            "المواقع المدعومة:\n"
-            "• Instagram\n• TikTok\n• X / Twitter"
-        )
+            "المواقع المدعومة:\n• Instagram\n• TikTok\n• X / Twitter")
         return
 
     chat_id = update.effective_chat.id
-    status_message = await update.message.reply_text(
-        "⏳ <b>جاري معالجة الرابط...</b>",
-        parse_mode="HTML",
-    )
+    status_message = await update.message.reply_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
     stop_event = threading.Event()
-    progress_task = asyncio.create_task(
-        update_status_message(status_message, stop_event)
-    )
+    progress_task = asyncio.create_task(update_status_message(status_message, stop_event))
     result = None
 
     try:
         async with download_semaphore:
             if is_tiktok_photo_url(url):
-                result = await asyncio.to_thread(
-                    download_tiktok_photo_post,
-                    url,
-                    chat_id,
-                )
+                result = await asyncio.to_thread(download_tiktok_photo_post, url, chat_id)
             else:
                 result = await asyncio.to_thread(download_video, url, chat_id)
 
@@ -529,9 +469,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         file_size = filename.stat().st_size
         if file_size > MAX_TELEGRAM_SIZE:
-            raise RuntimeError(
-                "❌ حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB)."
-            )
+            raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
 
         with filename.open("rb") as video:
             await update.message.reply_video(
@@ -548,15 +486,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         print(f"Download error for {url}: {exc!r}")
         message = str(exc)
-        if "50 MB" in message or "50 MB" in message:
+        if "50 MB" in message:
             user_message = "❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB)."
         elif is_tiktok_photo_url(url):
             user_message = "❌ تعذر تحميل صور TikTok. تأكد أن الرابط عام ثم جرّب مرة أخرى."
         else:
-            user_message = (
-                "❌ تعذر تحميل الفيديو\n\n"
-                "تأكد أن الرابط عام ويمكن فتحه بدون تسجيل دخول، ثم جرّب مرة أخرى."
-            )
+            user_message = "❌ تعذر تحميل الفيديو\n\nتأكد أن الرابط عام ويمكن فتحه بدون تسجيل دخول، ثم جرّب مرة أخرى."
         try:
             await status_message.edit_text(user_message)
         except Exception:
@@ -633,10 +568,7 @@ def webhook():
     try:
         data = request.get_json(force=True, silent=False)
         update = Update.de_json(data, telegram_application.bot)
-        asyncio.run_coroutine_threadsafe(
-            telegram_application.process_update(update),
-            bot_loop,
-        )
+        asyncio.run_coroutine_threadsafe(telegram_application.process_update(update), bot_loop)
         return jsonify({"ok": True})
     except Exception as exc:
         print(f"Webhook error: {exc!r}")
