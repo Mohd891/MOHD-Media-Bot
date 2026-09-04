@@ -104,6 +104,37 @@ def video_codecs(filename):
         return "", ""
 
 
+def video_dimensions(filename):
+    """Return the video's display width/height without changing the media."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:stream_tags=rotate",
+                "-of", "json", str(filename),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        streams = (json.loads(result.stdout or "{}").get("streams") or [])
+        if not streams:
+            return None
+        stream = streams[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if not width or not height:
+            return None
+        rotate = int(float((stream.get("tags") or {}).get("rotate") or 0)) % 360
+        if rotate in (90, 270):
+            width, height = height, width
+        return width, height
+    except (ValueError, TypeError, json.JSONDecodeError, FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+
+
 def prepare_mp4_for_mobile(filename):
     if filename.suffix.lower() != ".mp4" or not filename.is_file():
         return filename
@@ -293,9 +324,6 @@ def download_video(url, chat_id):
         elif data.get("status") == "finished":
             set_progress(chat_id, {"stage": "download_finished", "percent": 100})
 
-    # Instagram must always have audio. bv*+ba guarantees a video stream and
-    # an audio stream, with /b as the fallback for sites offering a combined file.
-    # For TikTok/X we keep the lighter combined-stream preference where possible.
     format_selector = "bv*+ba/b" if is_instagram_url(url) else "b[ext=mp4]/b/bv*+ba"
     options = {
         "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
@@ -425,8 +453,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise RuntimeError("Downloaded file is missing")
         if filename.stat().st_size > MAX_TELEGRAM_SIZE:
             raise RuntimeError("❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB).")
+
+        # Telegram accepts explicit video dimensions. Supplying the real display
+        # dimensions prevents some TikTok files with rotation/display metadata
+        # from being rendered as a square in Telegram.
+        dimensions = video_dimensions(filename)
+        if dimensions:
+            width, height = dimensions
+            print(f"Sending video dimensions: {width}x{height}")
+        else:
+            width = height = None
+
         with filename.open("rb") as video:
-            await update.message.reply_video(video=video, caption=f"🎬 {title[:900]}", supports_streaming=True)
+            await update.message.reply_video(
+                video=video,
+                caption=f"🎬 {title[:900]}",
+                width=width,
+                height=height,
+                supports_streaming=True,
+            )
 
     except Exception as exc:
         stop_event.set()
