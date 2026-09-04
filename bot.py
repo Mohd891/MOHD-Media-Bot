@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import subprocess
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
@@ -92,6 +93,47 @@ def is_tiktok_url(url):
     return host == "tiktok.com" or host.endswith(".tiktok.com")
 
 
+def prepare_mp4_for_mobile(filename):
+    """Move the MP4 metadata to the front without re-encoding the media."""
+    if filename.suffix.lower() != ".mp4":
+        return filename
+
+    optimized = filename.with_name(filename.stem + ".faststart.mp4")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(filename),
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(optimized),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if result.returncode == 0 and optimized.is_file() and optimized.stat().st_size > 0:
+            optimized.replace(filename)
+        elif optimized.exists():
+            optimized.unlink()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+        print(f"FFmpeg faststart skipped: {exc!r}")
+        if optimized.exists():
+            try:
+                optimized.unlink()
+            except OSError:
+                pass
+    return filename
+
+
 def find_downloaded_file(info, ydl):
     prepared = Path(ydl.prepare_filename(info))
     candidates = [prepared]
@@ -158,6 +200,7 @@ def download_video(url, chat_id):
         filename = find_downloaded_file(info, ydl)
         if not filename:
             raise RuntimeError("Downloaded file not found")
+        filename = prepare_mp4_for_mobile(filename)
         title = info.get("title") or "Video"
         return filename, title
 
