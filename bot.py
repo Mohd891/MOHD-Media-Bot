@@ -96,6 +96,11 @@ def is_tiktok_url(url):
     return host == "tiktok.com" or host.endswith(".tiktok.com")
 
 
+def is_instagram_url(url):
+    host = get_host(url)
+    return host == "instagram.com" or host.endswith(".instagram.com")
+
+
 def prepare_mp4_for_mobile(filename):
     """Move MP4 metadata to the front without re-encoding the media."""
     if filename.suffix.lower() != ".mp4":
@@ -126,6 +131,57 @@ def prepare_mp4_for_mobile(filename):
             except OSError:
                 pass
     return filename
+
+
+def make_instagram_mobile_compatible(filename):
+    """Create a phone-friendly H.264/AAC MP4 for Instagram/Reels.
+
+    Reels can be served in codecs/pixel formats that some phone playback
+    paths handle badly after Telegram saves the file. Re-encoding here makes
+    the saved file use H.264, 8-bit yuv420p, AAC and faststart.
+    """
+    if not filename.is_file():
+        return filename
+
+    compatible = filename.with_name(filename.stem + ".compatible.mp4")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(filename),
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "48000",
+                "-ac", "2",
+                "-movflags", "+faststart",
+                "-map_metadata", "-1",
+                str(compatible),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        if result.returncode == 0 and compatible.is_file() and compatible.stat().st_size > 0:
+            compatible.replace(filename)
+            return filename
+        error_tail = (result.stderr or "").strip()[-1500:]
+        print(f"Instagram compatibility conversion failed: {error_tail}")
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+        print(f"Instagram compatibility conversion skipped: {exc!r}")
+    finally:
+        if compatible.exists():
+            try:
+                compatible.unlink()
+            except OSError:
+                pass
+
+    return prepare_mp4_for_mobile(filename)
 
 
 def find_downloaded_file(info, ydl):
@@ -247,7 +303,12 @@ def download_video(url, chat_id):
             filename = find_downloaded_file(info, ydl)
             if not filename:
                 raise RuntimeError("Downloaded file not found")
-            filename = prepare_mp4_for_mobile(filename)
+
+            if is_instagram_url(url):
+                filename = make_instagram_mobile_compatible(filename)
+            else:
+                filename = prepare_mp4_for_mobile(filename)
+
             title = info.get("title") or "Video"
             return filename, title
     except Exception as primary_error:
