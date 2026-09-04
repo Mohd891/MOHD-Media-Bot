@@ -115,7 +115,6 @@ def video_codecs(filename):
 
 
 def video_dimensions(filename):
-    """Return the video's display width/height without changing the media."""
     try:
         result = subprocess.run(
             [
@@ -184,17 +183,15 @@ def make_instagram_mobile_compatible(filename):
     return prepare_mp4_for_mobile(filename)
 
 
-def find_downloaded_file(info, ydl, search_dir=DOWNLOAD_DIR, prefix=None):
+def find_downloaded_file(info, ydl, search_dir, prefix):
     prepared = Path(ydl.prepare_filename(info))
     candidates = [prepared]
     if prepared.suffix.lower() != ".mp4":
         candidates.append(prepared.with_suffix(".mp4"))
     for extension in (".webm", ".mkv", ".mov"):
         candidates.append(prepared.with_suffix(extension))
-
-    glob_prefix = prefix or (prepared.stem + ".")
     candidates.extend(
-        p for p in search_dir.glob(glob_prefix + "*")
+        p for p in search_dir.glob(prefix + "*")
         if p.is_file() and not p.name.endswith(".part")
     )
 
@@ -241,8 +238,8 @@ def mux_video_audio(video_path, audio_path, output_path):
     return output_path
 
 
-def recover_instagram_audio(info, ydl, job_dir, current_file):
-    video_codec, audio_codec = video_codecs(current_file)
+def recover_instagram_audio(job_dir, current_file):
+    _, audio_codec = video_codecs(current_file)
     if audio_codec:
         return current_file
 
@@ -267,8 +264,7 @@ def recover_instagram_audio(info, ydl, job_dir, current_file):
     audio_path = audio_candidates[0]
     output_path = job_dir / "instagram_with_audio.mp4"
     print(f"Instagram audio recovery: video={video_path.name} audio={audio_path.name}")
-    recovered = mux_video_audio(video_path, audio_path, output_path)
-    return recovered or current_file
+    return mux_video_audio(video_path, audio_path, output_path) or current_file
 
 
 def download_direct_file(media_url, filename, chat_id, accept="*/*", max_size=None):
@@ -396,38 +392,38 @@ def download_video(url, chat_id):
     job_dir = DOWNLOAD_DIR / f".job_{uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=True)
     output_prefix = "media"
-    options = {
-        "outtmpl": str(job_dir / f"{output_prefix}.%(id)s.%(ext)s"),
-        "format": format_selector,
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-        "progress_hooks": [progress_hook],
-        "socket_timeout": 30,
-        "retries": 2,
-        "fragment_retries": 2,
-    }
-
-    if is_tiktok_url(url):
-        options["extractor_args"] = {"tiktok": {"app_info": [
-            "7355728856979392260", "7351149742343391009", "7351144126450059040"
-        ]}}
 
     try:
+        options = {
+            "outtmpl": str(job_dir / f"{output_prefix}.%(id)s.%(ext)s"),
+            "format": format_selector,
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "restrictfilenames": True,
+            "progress_hooks": [progress_hook],
+            "socket_timeout": 30,
+            "retries": 2,
+            "fragment_retries": 2,
+        }
+
+        if is_tiktok_url(url):
+            options["extractor_args"] = {"tiktok": {"app_info": [
+                "7355728856979392260", "7351149742343391009", "7351144126450059040"
+            ]}}
+
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = find_downloaded_file(info, ydl, search_dir=job_dir, prefix=output_prefix + ".")
+            filename = find_downloaded_file(info, ydl, job_dir, output_prefix + ".")
             if not filename:
                 raise RuntimeError("Downloaded video file not found")
 
             if is_instagram:
-                filename = recover_instagram_audio(info, ydl, job_dir, filename)
+                filename = recover_instagram_audio(job_dir, filename)
                 _, audio_codec = video_codecs(filename)
                 if not audio_codec:
                     raise RuntimeError("Instagram Reel was downloaded without an audio stream")
-
                 filename = make_instagram_mobile_compatible(filename)
                 _, audio_codec = video_codecs(filename)
                 if not audio_codec:
@@ -436,7 +432,10 @@ def download_video(url, chat_id):
             if filename.stat().st_size > MAX_TELEGRAM_SIZE:
                 raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
 
-            return filename, info.get("title") or "Video"
+            stable_path = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+            filename.replace(stable_path)
+            return stable_path, info.get("title") or "Video"
+
     except Exception as primary_error:
         if not is_tiktok_url(url):
             raise
@@ -447,27 +446,16 @@ def download_video(url, chat_id):
             print(f"TikWM failed, trying second TikTok API: {tikwm_error!r}")
             return download_from_ttdown(url, chat_id)
     finally:
-        # Keep the successful file outside the job directory only for the caller;
-        # failed/temporary files are cleaned here. Successful Instagram/TikTok
-        # files are moved out before the directory is removed.
-        if job_dir.exists():
-            # If a successful file lives in this temporary directory, move it to
-            # a stable path before removing the directory.
-            pass
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
-def update_status_message(message, stop_event):
+async def update_status_message(message, stop_event):
     while not stop_event.is_set():
         try:
-            awaitable = message.edit_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
-            # This function is always run in the bot event loop.
-            import inspect
-            if inspect.isawaitable(awaitable):
-                yieldable = awaitable
-                raise RuntimeError("async placeholder")
+            await message.edit_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
         except Exception:
             pass
-        break
+        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,14 +591,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
-            # Remove temporary yt-dlp job directories after sending/handling.
-            for path in paths:
-                parent = path.parent
-                if parent.name.startswith(".job_"):
-                    try:
-                        shutil.rmtree(parent, ignore_errors=True)
-                    except OSError:
-                        pass
 
 
 def create_application():
