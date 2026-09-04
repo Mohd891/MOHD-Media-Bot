@@ -26,6 +26,7 @@ MAX_TELEGRAM_SIZE = 49 * 1024 * 1024
 PROGRESS_UPDATE_INTERVAL = 1.5
 DOWNLOAD_CONCURRENCY = 1
 TIKWM_API = "https://tikwm.com/api/"
+TIKTOK_API = "https://tdownv4.sl-bjs.workers.dev/"
 
 progress_data = {}
 progress_lock = threading.Lock()
@@ -134,12 +135,7 @@ def prepare_mp4_for_mobile(filename):
 
 
 def make_instagram_mobile_compatible(filename):
-    """Create a phone-friendly H.264/AAC MP4 for Instagram/Reels.
-
-    Reels can be served in codecs/pixel formats that some phone playback
-    paths handle badly after Telegram saves the file. Re-encoding here makes
-    the saved file use H.264, 8-bit yuv420p, AAC and faststart.
-    """
+    """Create a phone-friendly H.264/AAC MP4 for Instagram/Reels."""
     if not filename.is_file():
         return filename
 
@@ -203,8 +199,40 @@ def find_downloaded_file(info, ydl):
     return matches[0] if matches else None
 
 
+def download_direct_file(media_url, filename, chat_id):
+    media_request = Request(
+        media_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+            "Accept": "video/mp4,video/*,*/*;q=0.8",
+        },
+    )
+    with urlopen(media_request, timeout=60) as response, filename.open("wb") as output:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        while True:
+            chunk = response.read(1024 * 512)
+            if not chunk:
+                break
+            output.write(chunk)
+            downloaded += len(chunk)
+            percent = downloaded / total * 100 if total else 0
+            set_progress(chat_id, {
+                "stage": "download",
+                "percent": percent,
+                "downloaded": downloaded,
+                "total": total,
+                "speed": 0,
+                "eta": None,
+            })
+
+    if not filename.is_file() or filename.stat().st_size == 0:
+        raise RuntimeError("Downloader returned an empty video")
+    return filename
+
+
 def download_from_tikwm(url, chat_id):
-    """Fallback resolver for TikTok when yt-dlp cannot extract the post."""
+    """Fallback resolver for TikTok using TikWM."""
     api_url = f"{TIKWM_API}?url={quote(url, safe='')}&hd=1"
     request = Request(
         api_url,
@@ -226,34 +254,32 @@ def download_from_tikwm(url, chat_id):
 
     video_id = str(data.get("id") or "tiktok")
     filename = DOWNLOAD_DIR / f"{video_id}.mp4"
-    media_request = Request(
-        media_url,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-
-    with urlopen(media_request, timeout=60) as response, filename.open("wb") as output:
-        total = int(response.headers.get("Content-Length") or 0)
-        downloaded = 0
-        while True:
-            chunk = response.read(1024 * 512)
-            if not chunk:
-                break
-            output.write(chunk)
-            downloaded += len(chunk)
-            percent = downloaded / total * 100 if total else 0
-            set_progress(chat_id, {
-                "stage": "download",
-                "percent": percent,
-                "downloaded": downloaded,
-                "total": total,
-                "speed": 0,
-                "eta": None,
-            })
-
-    if not filename.is_file() or filename.stat().st_size == 0:
-        raise RuntimeError("TikWM returned an empty video")
-
+    download_direct_file(media_url, filename, chat_id)
     title = data.get("title") or "TikTok Video"
+    return prepare_mp4_for_mobile(filename), title
+
+
+def download_from_ttdown(url, chat_id):
+    """Second TikTok fallback for short and long TikTok links."""
+    api_url = f"{TIKTOK_API}?down={quote(url, safe='')}"
+    request = Request(
+        api_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    media_url = payload.get("download_url")
+    if not media_url:
+        raise RuntimeError(payload.get("message") or payload.get("error") or "Second TikTok API returned no video URL")
+
+    video_id = str(payload.get("video_id") or "tiktok")
+    filename = DOWNLOAD_DIR / f"{video_id}.mp4"
+    download_direct_file(media_url, filename, chat_id)
+    title = payload.get("title") or "TikTok Video"
     return prepare_mp4_for_mobile(filename), title
 
 
@@ -314,43 +340,25 @@ def download_video(url, chat_id):
     except Exception as primary_error:
         if not is_tiktok_url(url):
             raise
-        print(f"TikTok yt-dlp failed, trying fallback: {primary_error!r}")
+        print(f"TikTok yt-dlp failed, trying TikWM: {primary_error!r}")
         set_progress(chat_id, {"stage": "starting"})
         try:
             return download_from_tikwm(url, chat_id)
-        except Exception as fallback_error:
-            raise RuntimeError(
-                f"TikTok download failed with both methods: {fallback_error}"
-            ) from primary_error
+        except Exception as tikwm_error:
+            print(f"TikWM failed, trying second TikTok API: {tikwm_error!r}")
+            set_progress(chat_id, {"stage": "starting"})
+            try:
+                return download_from_ttdown(url, chat_id)
+            except Exception as second_error:
+                raise RuntimeError(
+                    f"TikTok download failed with all methods: {second_error}"
+                ) from primary_error
 
 
 async def update_status_message(message, chat_id, stop_event):
     last_text = None
     while not stop_event.is_set():
-        data = get_progress(chat_id)
-        stage = data.get("stage")
-        if stage == "download":
-            percent = data.get("percent", 0)
-            downloaded = data.get("downloaded", 0)
-            total = data.get("total", 0)
-            speed = data.get("speed", 0)
-            eta = data.get("eta")
-            text = (
-                "🎬 <b>MOHD MEDIA</b>\n\n"
-                "⬇️ <b>جاري تحميل الفيديو</b>\n\n"
-                f"{progress_bar(percent)} <b>{percent:.0f}%</b>\n\n"
-                f"📦 {format_bytes(downloaded)}"
-            )
-            if total:
-                text += f" / {format_bytes(total)}"
-            if speed:
-                text += f"\n⚡ السرعة: {format_bytes(speed)}/ث"
-            if eta is not None:
-                text += f"\n⏱️ المتبقي: {format_time(eta)}"
-        elif stage == "download_finished":
-            text = "🎬 <b>MOHD MEDIA</b>\n\n✅ اكتمل التحميل\n🔍 جاري تجهيز الفيديو..."
-        else:
-            text = "🎬 <b>MOHD MEDIA</b>\n\n⏳ جاري معالجة الرابط..."
+        text = "⏳ <b>جاري معالجة الرابط...</b>"
         if text != last_text:
             try:
                 await message.edit_text(text, parse_mode="HTML")
@@ -396,7 +404,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     status_message = await update.message.reply_text(
-        "🎬 <b>MOHD MEDIA</b>\n\n⏳ جاري تجهيز الرابط...",
+        "⏳ <b>جاري معالجة الرابط...</b>",
         parse_mode="HTML",
     )
     stop_event = threading.Event()
