@@ -1,10 +1,12 @@
 import asyncio
+import json
 import os
 import re
 import subprocess
 import threading
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 import yt_dlp
 from flask import Flask, jsonify, request
@@ -23,6 +25,7 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_TELEGRAM_SIZE = 49 * 1024 * 1024
 PROGRESS_UPDATE_INTERVAL = 1.5
 DOWNLOAD_CONCURRENCY = 1
+TIKWM_API = "https://tikwm.com/api/"
 
 progress_data = {}
 progress_lock = threading.Lock()
@@ -94,7 +97,7 @@ def is_tiktok_url(url):
 
 
 def prepare_mp4_for_mobile(filename):
-    """Move the MP4 metadata to the front without re-encoding the media."""
+    """Move MP4 metadata to the front without re-encoding the media."""
     if filename.suffix.lower() != ".mp4":
         return filename
 
@@ -102,17 +105,8 @@ def prepare_mp4_for_mobile(filename):
     try:
         result = subprocess.run(
             [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(filename),
-                "-map",
-                "0",
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(optimized),
+                "ffmpeg", "-y", "-i", str(filename), "-map", "0",
+                "-c", "copy", "-movflags", "+faststart", str(optimized),
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -153,6 +147,60 @@ def find_downloaded_file(info, ydl):
     return matches[0] if matches else None
 
 
+def download_from_tikwm(url, chat_id):
+    """Fallback resolver for TikTok when yt-dlp cannot extract the post."""
+    api_url = f"{TIKWM_API}?url={quote(url, safe='')}&hd=1"
+    request = Request(
+        api_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    with urlopen(request, timeout=25) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if payload.get("code") != 0:
+        raise RuntimeError(f"TikWM error: {payload.get('msg') or 'unknown error'}")
+
+    data = payload.get("data") or {}
+    media_url = data.get("hdplay") or data.get("play")
+    if not media_url:
+        raise RuntimeError("TikWM returned no video URL")
+
+    video_id = str(data.get("id") or "tiktok")
+    filename = DOWNLOAD_DIR / f"{video_id}.mp4"
+    media_request = Request(
+        media_url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+
+    with urlopen(media_request, timeout=60) as response, filename.open("wb") as output:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        while True:
+            chunk = response.read(1024 * 512)
+            if not chunk:
+                break
+            output.write(chunk)
+            downloaded += len(chunk)
+            percent = downloaded / total * 100 if total else 0
+            set_progress(chat_id, {
+                "stage": "download",
+                "percent": percent,
+                "downloaded": downloaded,
+                "total": total,
+                "speed": 0,
+                "eta": None,
+            })
+
+    if not filename.is_file() or filename.stat().st_size == 0:
+        raise RuntimeError("TikWM returned an empty video")
+
+    title = data.get("title") or "TikTok Video"
+    return prepare_mp4_for_mobile(filename), title
+
+
 def download_video(url, chat_id):
     def progress_hook(data):
         status = data.get("status")
@@ -182,8 +230,6 @@ def download_video(url, chat_id):
         "progress_hooks": [progress_hook],
     }
 
-    # TikTok's web endpoint is currently unstable. Ask yt-dlp to try its
-    # mobile API first; this is supported by the TikTok extractor itself.
     if is_tiktok_url(url):
         options["extractor_args"] = {
             "tiktok": {
@@ -195,14 +241,26 @@ def download_video(url, chat_id):
             },
         }
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = find_downloaded_file(info, ydl)
-        if not filename:
-            raise RuntimeError("Downloaded file not found")
-        filename = prepare_mp4_for_mobile(filename)
-        title = info.get("title") or "Video"
-        return filename, title
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = find_downloaded_file(info, ydl)
+            if not filename:
+                raise RuntimeError("Downloaded file not found")
+            filename = prepare_mp4_for_mobile(filename)
+            title = info.get("title") or "Video"
+            return filename, title
+    except Exception as primary_error:
+        if not is_tiktok_url(url):
+            raise
+        print(f"TikTok yt-dlp failed, trying fallback: {primary_error!r}")
+        set_progress(chat_id, {"stage": "starting"})
+        try:
+            return download_from_tikwm(url, chat_id)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"TikTok download failed with both methods: {fallback_error}"
+            ) from primary_error
 
 
 async def update_status_message(message, chat_id, stop_event):
