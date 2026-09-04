@@ -79,12 +79,15 @@ def progress_bar(percent, length=14):
     return "█" * filled + "░" * (length - filled)
 
 
-def is_supported_url(url):
+def get_host(url):
     try:
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
+        return (urlparse(url).hostname or "").lower().rstrip(".")
     except ValueError:
-        return False
+        return ""
 
+
+def is_supported_url(url):
+    host = get_host(url)
     allowed = (
         "instagram.com",
         "tiktok.com",
@@ -92,6 +95,11 @@ def is_supported_url(url):
         "twitter.com",
     )
     return any(host == domain or host.endswith("." + domain) for domain in allowed)
+
+
+def is_tiktok_url(url):
+    host = get_host(url)
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
 
 
 def find_downloaded_file(info, ydl):
@@ -109,7 +117,7 @@ def find_downloaded_file(info, ydl):
     # Fallback for unusual post-processing/extension changes.
     prefix = prepared.stem + "."
     matches = sorted(
-        DOWNLOAD_DIR.glob(prefix + "*"),
+        (p for p in DOWNLOAD_DIR.glob(prefix + "*") if p.is_file() and not p.name.endswith(".part")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -151,6 +159,12 @@ def download_video(url, chat_id):
         "restrictfilenames": True,
         "progress_hooks": [progress_hook],
     }
+
+    # TikTok is currently more aggressive about browser/TLS fingerprinting.
+    # curl-cffi lets yt-dlp impersonate a real browser for this site only,
+    # without slowing down Instagram and X/Twitter downloads.
+    if is_tiktok_url(url):
+        options["impersonate"] = "chrome-131"
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
