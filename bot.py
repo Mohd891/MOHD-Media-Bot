@@ -264,6 +264,13 @@ def download_instagram(url, chat_id, job_dir):
 
     video_dir = job_dir / "video"
     video_dir.mkdir()
+    cookiefile = None
+    cookie_text = os.getenv("INSTAGRAM_COOKIES", "").strip()
+    if cookie_text:
+        cookiefile = job_dir / "instagram_cookies.txt"
+        cookiefile.write_text(cookie_text.replace("\r\n", "\n") + "\n", encoding="utf-8")
+        print("Instagram cookies configured")
+
     options = {
         "outtmpl": str(video_dir / "video.%(id)s.%(ext)s"),
         "format": "bv*[vcodec^=avc1]+ba/b[ext=mp4]/b",
@@ -277,6 +284,9 @@ def download_instagram(url, chat_id, job_dir):
         "retries": 2,
         "fragment_retries": 2,
     }
+    if cookiefile:
+        options["cookiefile"] = str(cookiefile)
+
     primary_error = None
     filename = None
     info = None
