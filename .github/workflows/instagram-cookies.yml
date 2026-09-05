@@ -1,0 +1,31 @@
+name: Patch Instagram cookie support
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch bot.py
+        env:
+          PATCH_B64: ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCnA9UGF0aCgiYm90LnB5IikKcz1wLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQpuZWVkbGU9JyAgICB2aWRlb19kaXIgPSBqb2JfZGlyIC8gInZpZGVvIlxuICAgIHZpZGVvX2Rpci5ta2RpcigpJwppbnNlcnQ9JycnICAgIHZpZGVvX2RpciA9IGpvYl9kaXIgLyAidmlkZW8iCiAgICB2aWRlb19kaXIubWtkaXIoKQogICAgY29va2llZmlsZSA9IE5vbmUKICAgIGNvb2tpZV90ZXh0ID0gb3MuZ2V0ZW52KCJJTlNUQUdSQU1fQ09PS0lFUyIsICIiKS5zdHJpcCgpCiAgICBpZiBjb29raWVfdGV4dDoKICAgICAgICBjb29raWVmaWxlID0gam9iX2RpciAvICJpbnN0YWdyYW1fY29va2llcy50eHQiCiAgICAgICAgY29va2llZmlsZS53cml0ZV90ZXh0KGNvb2tpZV90ZXh0LnJlcGxhY2UoIlxcclxcbiIsICJcXG4iKSArICJcXG4iLCBlbmNvZGluZz0idXRmLTgiKQogICAgICAgIHByaW50KCJJbnN0YWdyYW0gY29va2llcyBjb25maWd1cmVkIikKJycnCmlmICdJTlNUQUdSQU1fQ09PS0lFUycgbm90IGluIHM6CiAgICBzPXMucmVwbGFjZShuZWVkbGUsIGluc2VydCwgMSkKbmVlZGxlMj0nICAgICAgICAiZnJhZ21lbnRfcmV0cmllcyI6IDIsXG4gICAgfScKaW5zZXJ0Mj0nJycgICAgICAgICJmcmFnbWVudF9yZXRyaWVzIjogMiwKICAgIH0KICAgIGlmIGNvb2tpZWZpbGU6CiAgICAgICAgb3B0aW9uc1siY29va2llZmlsZSJdID0gc3RyKGNvb2tpZWZpbGUpCicnJwppZiAnb3B0aW9uc1siY29va2llZmlsZSJdJyBub3QgaW4gczoKICAgIHM9cy5yZXBsYWNlKG5lZWRsZTIsIGluc2VydDIsIDEpCnAud3JpdGVfdGV4dChzLCBlbmNvZGluZz0idXRmLTgiKQpwcmludCgicGF0Y2hlZCIpCg==
+        run: |
+          python -c "import base64,os; exec(base64.b64decode(os.environ['PATCH_B64']).decode())"
+          python -m py_compile bot.py
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add bot.py
+          git diff --cached --quiet && exit 0
+          git commit -m "fix: support Instagram authenticated cookies"
+          git push
