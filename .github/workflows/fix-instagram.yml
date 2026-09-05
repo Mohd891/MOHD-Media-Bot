@@ -1,0 +1,140 @@
+name: Fix Instagram downloader
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Patch Instagram downloader
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('bot.py')
+          text = path.read_text(encoding='utf-8')
+
+          start = text.index('def download_instagram(')
+          end = text.index('\ndef download_video(', start)
+
+          new_function = r'''def download_instagram(url, chat_id, job_dir):
+              def hook(data):
+                  if data.get("status") == "downloading":
+                      done = data.get("downloaded_bytes", 0) or 0
+                      total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                      set_progress(chat_id, {"stage": "download", "percent": done / total * 100 if total else 0})
+
+              video_dir = job_dir / "video"
+              video_dir.mkdir()
+
+              # Instagram age-gated/login-only media requires an authenticated
+              # session. Keep the cookie contents out of the repository and logs;
+              # Render supplies them through the INSTAGRAM_COOKIES secret.
+              cookiefile = None
+              cookie_text = os.getenv("INSTAGRAM_COOKIES", "").strip()
+              if cookie_text:
+                  cookiefile = job_dir / "instagram_cookies.txt"
+                  cookiefile.write_text(cookie_text.replace("\\r\\n", "\\n") + "\\n", encoding="utf-8")
+                  print("Instagram authenticated session: cookies configured")
+              else:
+                  print("Instagram authenticated session: no cookies configured")
+
+              def make_options(app_id):
+                  options = {
+                      "outtmpl": str(video_dir / f"video_{app_id}.%(id)s.%(ext)s"),
+                      "format": "bv*[vcodec^=avc1]+ba/b[ext=mp4]/b",
+                      "merge_output_format": "mp4",
+                      "noplaylist": True,
+                      "quiet": True,
+                      "no_warnings": True,
+                      "restrictfilenames": True,
+                      "progress_hooks": [hook],
+                      "socket_timeout": 30,
+                      "retries": 2,
+                      "fragment_retries": 2,
+                      "extractor_args": {"instagram": {"app_id": [app_id]}},
+                  }
+                  if cookiefile:
+                      options["cookiefile"] = str(cookiefile)
+                  return options
+
+              attempts = ["web", "ios"] if cookiefile else ["ios", "web"]
+              errors = []
+              filename = None
+              info = None
+
+              for app_id in attempts:
+                  try:
+                      print(f"Instagram extraction attempt: app_id={app_id}, authenticated={bool(cookiefile)}")
+                      with yt_dlp.YoutubeDL(make_options(app_id)) as ydl:
+                          info = ydl.extract_info(url, download=True)
+                      filename = locate_video_file(video_dir, f"video_{app_id}.")
+                      if filename:
+                          print(f"Instagram extraction succeeded: app_id={app_id}, file={filename.name}")
+                          break
+                  except Exception as exc:
+                      errors.append(f"{app_id}: {exc}")
+                      print(f"Instagram extraction failed: app_id={app_id}: {exc!r}")
+
+              if not filename:
+                  if cookiefile:
+                      raise RuntimeError("Instagram requires a valid logged-in session for this content. The configured Instagram cookies may be expired or may belong to an account without access to the Reel.")
+                  raise RuntimeError("Instagram requires login for this Reel. Configure INSTAGRAM_COOKIES in Render for age-restricted or login-only content.")
+
+              print(f"Instagram initial file: {filename.name}; streams={video_codecs(filename)}")
+              if not video_codecs(filename)[1]:
+                  audio_dir = job_dir / "audio"
+                  audio_dir.mkdir()
+                  audio_options = make_options(attempts[0])
+                  audio_options["outtmpl"] = str(audio_dir / "audio.%(id)s.%(ext)s")
+                  audio_options["format"] = "ba[acodec]/bestaudio/b"
+                  try:
+                      print("Instagram video has no audio; requesting audio-only fallback")
+                      with yt_dlp.YoutubeDL(audio_options) as ydl:
+                          ydl.extract_info(url, download=True)
+                      audio_file = locate_audio_file(audio_dir)
+                      if audio_file:
+                          recovered = mux_video_audio(filename, audio_file, job_dir / "instagram_with_audio.mp4")
+                          if recovered:
+                              filename = recovered
+                  except Exception as exc:
+                      print(f"Instagram audio fallback failed: {exc!r}")
+
+              if not video_codecs(filename)[1]:
+                  raise RuntimeError("Instagram Reel was downloaded without an audio stream")
+              filename = faststart_mp4(filename)
+              if not video_codecs(filename)[1]:
+                  raise RuntimeError("Instagram Reel audio stream is missing after processing")
+              if filename.stat().st_size > MAX_TELEGRAM_SIZE:
+                  raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
+              stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+              filename.replace(stable)
+              return stable, (info or {}).get("title") or "Instagram Reel"
+'''
+
+          text = text[:start] + new_function + text[end:]
+          path.write_text(text, encoding='utf-8')
+          print('bot.py patched')
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot.py
+          git diff --cached --quiet && exit 0
+          git commit -m "fix: support authenticated Instagram reels"
+          git push
