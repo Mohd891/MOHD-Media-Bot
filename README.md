@@ -8,6 +8,7 @@ Telegram media downloader for public Instagram, TikTok, and X/Twitter links.
 - Build command: `pip install -r requirements.txt`
 - Start command: `python bot.py`
 - Required environment variable: `BOT_TOKEN`
+- Optional environment variable: `INSTAGRAM_COOKIES` for Instagram content that requires a logged-in session.
 - The app uses Render's `RENDER_EXTERNAL_URL` automatically for the Telegram webhook.
 
 ## Notes
