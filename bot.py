@@ -279,22 +279,187 @@ def download_from_ttdown(url, chat_id):
     return filename, payload.get("title") or "TikTok Video"
 
 
-def download_instagram(url, chat_id, job_dir):
+INSTAGRAM_APP_IDS = ("web", "ios")
+VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+
+
+def instagram_cookiefile(job_dir):
+    cookie_text = os.getenv("INSTAGRAM_COOKIES", "").strip()
+    if not cookie_text:
+        return None
+    cookiefile = job_dir / "instagram_cookies.txt"
+    if not cookiefile.exists():
+        cookiefile.write_text(cookie_text.replace("\r\n", "\n") + "\n", encoding="utf-8")
+        print("Instagram cookies configured")
+    return cookiefile
+
+
+def find_key(obj, key):
+    """Return the first non-empty value for key anywhere inside nested dicts/lists."""
+    if isinstance(obj, dict):
+        if obj.get(key):
+            return obj[key]
+        values = obj.values()
+    elif isinstance(obj, list):
+        values = obj
+    else:
+        return None
+    for value in values:
+        found = find_key(value, key)
+        if found:
+            return found
+    return None
+
+
+def best_url(candidates):
+    items = [c for c in (candidates or []) if isinstance(c, dict) and c.get("url")]
+    if not items:
+        return None
+    items.sort(key=lambda c: (c.get("width") or 0) * (c.get("height") or 0), reverse=True)
+    return items[0]["url"]
+
+
+def instagram_raw_media(url, job_dir, app_id):
+    """Fetch Instagram's raw post JSON through yt-dlp (handles headers/tokens), without downloading."""
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "ignore_no_formats_error": True,
+        "socket_timeout": 30,
+        "extractor_args": {"instagram": {"app_id": [app_id]}},
+    }
+    cookiefile = instagram_cookiefile(job_dir)
+    if cookiefile:
+        options["cookiefile"] = str(cookiefile)
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False, process=False)
+    raw = (info or {}).get("_mohd_raw") or {}
+    if not raw:
+        raise RuntimeError("Instagram returned no post data")
+    return raw, info
+
+
+def describe_formats(info):
+    rows = []
+    for f in (info or {}).get("formats") or []:
+        rows.append(f"{f.get('format_id')}:{f.get('vcodec')}/{f.get('acodec')}:{f.get('height')}")
+    return ", ".join(rows) or "none"
+
+
+def instagram_music(raw):
+    """Return (audio_url, start_seconds, duration_seconds) for a post's attached music, if any."""
+    holders = [raw.get(k) for k in ("music_metadata", "clips_metadata", "music_info") if raw.get(k)] + [raw]
+    for holder in holders:
+        audio_url = find_key(holder, "progressive_download_url") or find_key(holder, "fast_start_progressive_download_url")
+        if audio_url:
+            start_ms = find_key(holder, "audio_asset_start_time_in_ms") or 0
+            length_ms = find_key(holder, "overlap_duration_in_ms") or find_key(holder, "duration_in_ms") or 0
+            try:
+                start, length = float(start_ms) / 1000, float(length_ms) / 1000
+            except (TypeError, ValueError):
+                start, length = 0.0, 0.0
+            return audio_url, max(start, 0.0), length
+    return None
+
+
+def media_duration(filename):
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(filename)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15, check=False)
+        return float(result.stdout.strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def render_photos_with_audio(images, audio_file, start, length, output):
+    """Turn one or more photos plus a music clip into an H.264 MP4 (slideshow if several photos)."""
+    available = max(media_duration(audio_file) - start, 0)
+    if available <= 0:
+        start, available = 0.0, media_duration(audio_file)
+    duration = length if 0 < length <= available else min(available or 15.0, 30.0)
+    duration = min(max(duration, 3.0), 60.0)
+    count = len(images)
+    per_image = max(duration / count, 2.0)
+    total = per_image * count
+    args = ["-threads", "2"]
+    for image in images:
+        args += ["-loop", "1", "-framerate", "15", "-t", f"{per_image:.2f}", "-i", str(image)]
+    args += ["-ss", f"{start:.2f}", "-i", str(audio_file)]
+    if count == 1:
+        graph = "[0:v]scale='min(1080,iw)':-2,setsar=1,format=yuv420p[v]"
+    else:
+        graph = "".join(
+            f"[{i}:v]scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v{i}];"
+            for i in range(count)
+        ) + "".join(f"[v{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=0[v]"
+    args += ["-filter_complex", graph, "-map", "[v]", "-map", f"{count}:a:0", "-af", "apad",
+             "-t", f"{total:.2f}", "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage",
+             "-crf", "23", "-r", "15", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)]
+    result = run_ffmpeg(args, timeout=300)
+    if result and result.returncode == 0 and output.is_file() and output.stat().st_size > 0:
+        return output
+    output.unlink(missing_ok=True)
+    return None
+
+
+def download_instagram_photos(raw, chat_id, job_dir):
+    """Photos, carousels (photos + videos), and photos with attached music -> dict result."""
+    items = raw.get("carousel_media") or [raw]
+    photos, videos = [], []
+    for index, item in enumerate(items, 1):
+        set_progress(chat_id, {"stage": "download", "percent": (index - 1) / len(items) * 100})
+        video_url = best_url(item.get("video_versions"))
+        if video_url:
+            path = job_dir / f"item_{index:02d}.mp4"
+            download_direct_file(video_url, path, chat_id, "video/mp4,video/*,*/*;q=0.8", MAX_TELEGRAM_SIZE)
+            path = faststart_mp4(ensure_h264(path, job_dir))
+            stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+            path.replace(stable)
+            videos.append(stable)
+            continue
+        image_url = best_url(find_key(item, "candidates")) or item.get("display_url")
+        if image_url:
+            path = DOWNLOAD_DIR / f"photo_{uuid4().hex}.jpg"
+            download_direct_file(image_url, path, chat_id, "image/jpeg,image/*,*/*;q=0.8", MAX_TELEGRAM_PHOTO_SIZE)
+            photos.append(path)
+    if not photos and not videos:
+        raise RuntimeError("Instagram post has no downloadable media")
+
+    music_videos = []
+    music = instagram_music(raw)
+    print(f"Instagram post: photos={len(photos)} videos={len(videos)} music={'yes' if music else 'no'}")
+    if music and photos:
+        audio_url, start, length = music
+        audio_file = job_dir / "music.m4a"
+        try:
+            download_direct_file(audio_url, audio_file, chat_id, "audio/*,*/*;q=0.8", MAX_TELEGRAM_SIZE)
+            print("Rendering photo(s) with music into a video")
+            rendered = render_photos_with_audio(photos, audio_file, start, length, job_dir / "photo_music.mp4")
+            if rendered and rendered.stat().st_size <= MAX_TELEGRAM_SIZE:
+                stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
+                rendered.replace(stable)
+                music_videos.append(stable)
+        except Exception as exc:
+            print(f"Instagram music render failed: {exc!r}")
+    title = (raw.get("caption") or {}).get("text") if isinstance(raw.get("caption"), dict) else None
+    username = (raw.get("user") or {}).get("username") if isinstance(raw.get("user"), dict) else None
+    # A single photo with music is sent as the video only; carousels also get the original photos.
+    if music_videos and len(photos) == 1 and not videos:
+        for p in photos:
+            p.unlink(missing_ok=True)
+        photos = []
+    return {"videos": music_videos + videos, "photos": photos, "title": title or (f"Instagram @{username}" if username else "Instagram")}
+
+
+def download_instagram_video(url, chat_id, job_dir, app_id):
     def hook(data):
         if data.get("status") == "downloading":
             done = data.get("downloaded_bytes", 0) or 0
             total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
             set_progress(chat_id, {"stage": "download", "percent": done / total * 100 if total else 0})
 
-    video_dir = job_dir / "video"
+    video_dir = job_dir / f"video_{app_id}"
     video_dir.mkdir()
-    cookiefile = None
-    cookie_text = os.getenv("INSTAGRAM_COOKIES", "").strip()
-    if cookie_text:
-        cookiefile = job_dir / "instagram_cookies.txt"
-        cookiefile.write_text(cookie_text.replace("\r\n", "\n") + "\n", encoding="utf-8")
-        print("Instagram cookies configured")
-
     options = {
         "outtmpl": str(video_dir / "video.%(id)s.%(ext)s"),
         "format": "bv*[vcodec^=avc1]+ba/bv*+ba/b[ext=mp4]/b",
@@ -307,56 +472,73 @@ def download_instagram(url, chat_id, job_dir):
         "socket_timeout": 30,
         "retries": 2,
         "fragment_retries": 2,
+        "extractor_args": {"instagram": {"app_id": [app_id]}},
     }
+    cookiefile = instagram_cookiefile(job_dir)
     if cookiefile:
         options["cookiefile"] = str(cookiefile)
-
-    primary_error = None
-    filename = None
-    info = None
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-        filename = locate_video_file(video_dir, "video.")
-    except Exception as exc:
-        primary_error = exc
-        print(f"Instagram yt-dlp primary failed: {exc!r}")
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+    print(f"Instagram formats ({app_id}): {describe_formats(info)}")
+    filename = locate_video_file(video_dir, "video.")
     if not filename:
-        raise RuntimeError(str(primary_error) if primary_error else "Instagram video was not downloaded")
+        raise RuntimeError("Instagram video was not downloaded")
+    print(f"Instagram file ({app_id}): {filename.name}; streams={video_codecs(filename)}")
+    return filename, info
 
-    print(f"Instagram initial file: {filename.name}; streams={video_codecs(filename)}")
-    if not video_codecs(filename)[1]:
-        audio_dir = job_dir / "audio"
-        audio_dir.mkdir()
-        audio_options = {
-            "outtmpl": str(audio_dir / "audio.%(id)s.%(ext)s"),
-            "format": "ba/bestaudio/b",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            "socket_timeout": 30,
-            "retries": 2,
-            "fragment_retries": 2,
-        }
+
+def download_instagram(url, chat_id, job_dir):
+    path = urlparse(url).path.lower()
+    if "/p/" in path:
+        # Posts can be photos, carousels or videos: inspect the post first.
+        raw = None
+        for app_id in INSTAGRAM_APP_IDS:
+            try:
+                raw, _ = instagram_raw_media(url, job_dir, app_id)
+                break
+            except Exception as exc:
+                print(f"Instagram post data ({app_id}) failed: {exc!r}")
+        if raw is None:
+            raise RuntimeError("Instagram post data could not be read")
+        print(f"Instagram post media_type={raw.get('media_type')} carousel={bool(raw.get('carousel_media'))} keys={sorted(raw.keys())[:60]}")
+        if raw.get("carousel_media") or not raw.get("video_versions"):
+            return download_instagram_photos(raw, chat_id, job_dir)
+
+    silent_file, info, last_error = None, None, None
+    for app_id in INSTAGRAM_APP_IDS:
         try:
-            print("Instagram video has no audio; requesting audio-only fallback")
-            with yt_dlp.YoutubeDL(audio_options) as ydl:
-                ydl.extract_info(url, download=True)
-            audio_file = locate_audio_file(audio_dir)
-            if audio_file:
-                recovered = mux_video_audio(filename, audio_file, job_dir / "instagram_with_audio.mp4")
-                if recovered:
-                    filename = recovered
+            filename, info = download_instagram_video(url, chat_id, job_dir, app_id)
         except Exception as exc:
-            print(f"Instagram audio fallback failed: {exc!r}")
+            last_error = exc
+            print(f"Instagram yt-dlp ({app_id}) failed: {exc!r}")
+            continue
+        if video_codecs(filename)[1]:
+            break
+        silent_file = silent_file or filename
+        print(f"Instagram video from {app_id} has no audio; trying next source")
+    else:
+        filename = None
 
-    if not video_codecs(filename)[1]:
-        raise RuntimeError("Instagram Reel was downloaded without an audio stream")
-    filename = ensure_h264(filename, job_dir)
-    filename = faststart_mp4(filename)
-    if not video_codecs(filename)[1]:
-        raise RuntimeError("Instagram Reel audio stream is missing after processing")
+    if not filename and silent_file:
+        # Last resort: some reels carry their soundtrack as attached music in the post data.
+        try:
+            raw, _ = instagram_raw_media(url, job_dir, INSTAGRAM_APP_IDS[0])
+            music = instagram_music(raw)
+            print(f"Instagram silent video; attached music={'yes' if music else 'no'}")
+            if music:
+                audio_file = job_dir / "music.m4a"
+                download_direct_file(music[0], audio_file, chat_id, "audio/*,*/*;q=0.8", MAX_TELEGRAM_SIZE)
+                filename = mux_video_audio(silent_file, audio_file, job_dir / "instagram_with_audio.mp4")
+        except Exception as exc:
+            print(f"Instagram music fallback failed: {exc!r}")
+        if not filename:
+            # Video genuinely has no sound: send it rather than failing.
+            print("Sending Instagram video without audio")
+            filename = silent_file
+    if not filename:
+        raise RuntimeError(str(last_error) if last_error else "Instagram video was not downloaded")
+
+    filename = faststart_mp4(ensure_h264(filename, job_dir))
     if filename.stat().st_size > MAX_TELEGRAM_SIZE:
         raise RuntimeError("حجم الفيديو أكبر من حد Telegram المسموح للبوت (50 MB).")
     stable = DOWNLOAD_DIR / f"result_{uuid4().hex}.mp4"
@@ -447,10 +629,30 @@ async def delete_quietly(message):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎬 <b>MOHD MEDIA BOT</b>\n\nأرسل الرابط وسأتولى الباقي.\n\n✅ Instagram / Reels\n✅ TikTok\n✅ X / Twitter\n\n🚀 تحميل بأفضل جودة متاحة\n⚡ بدون ضغط تلقائي\n\n🔗 أرسل الرابط الآن.", parse_mode="HTML")
+    await update.message.reply_text("🎬 <b>MOHD MEDIA BOT</b>\n\nأرسل الرابط وسأتولى الباقي.\n\n✅ Instagram: Reels، صور، ألبومات، وصور مع موسيقى (تتحول لفيديو)\n✅ TikTok\n✅ X / Twitter\n\n🚀 تحميل بأفضل جودة متاحة\n⚡ بدون ضغط تلقائي\n\n🔗 أرسل الرابط الآن.", parse_mode="HTML")
 
 
-async def send_photo_album(message, paths, title):
+async def send_video_file(message, filename, title):
+    if filename.stat().st_size > MAX_TELEGRAM_SIZE:
+        raise RuntimeError("❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB).")
+    dimensions = video_dimensions(filename)
+    width, height = dimensions if dimensions else (None, None)
+    with filename.open("rb") as video:
+        await message.reply_video(video=video, caption=f"🎬 {title[:900]}", width=width, height=height, supports_streaming=True, write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
+
+
+async def send_instagram_bundle(message, result):
+    """Send an Instagram post: videos (incl. photo+music videos) first, then the photos as an album."""
+    title = result.get("title") or "Instagram"
+    for video_path in result.get("videos") or []:
+        if video_path.is_file():
+            await send_video_file(message, video_path, title)
+    photos = [p for p in result.get("photos") or [] if p.is_file()]
+    if photos:
+        await send_photo_album(message, photos, title, label="🖼️ صورة من Instagram")
+
+
+async def send_photo_album(message, paths, title, label="🖼️ صورة من TikTok Photo Mode"):
     for start in range(0, len(paths), 10):
         batch = paths[start:start + 10]
         photo_paths = [p for p in batch if p.is_file() and p.stat().st_size <= MAX_TELEGRAM_PHOTO_SIZE]
@@ -473,7 +675,7 @@ async def send_photo_album(message, paths, title):
                     handle.close()
         for path in large_paths:
             with path.open("rb") as photo:
-                await message.reply_document(document=photo, caption="🖼️ صورة من TikTok Photo Mode", write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
+                await message.reply_document(document=photo, caption=label, write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -508,6 +710,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = await asyncio.to_thread(download_video, url, chat_id)
         stop_event.set()
         await progress_task
+        if isinstance(result, dict):
+            await send_instagram_bundle(update.message, result)
+            await delete_quietly(status_message)
+            return
         if isinstance(result[0], list):
             await send_photo_album(update.message, result[0], result[1])
             await delete_quietly(status_message)
@@ -515,14 +721,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename, title = result
         if not filename or not filename.is_file():
             raise RuntimeError("Downloaded file is missing")
-        if filename.stat().st_size > MAX_TELEGRAM_SIZE:
-            raise RuntimeError("❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB).")
-        dimensions = video_dimensions(filename)
-        width, height = dimensions if dimensions else (None, None)
-        if dimensions:
-            print(f"Sending video dimensions: {width}x{height}")
-        with filename.open("rb") as video:
-            await update.message.reply_video(video=video, caption=f"🎬 {title[:900]}", width=width, height=height, supports_streaming=True, write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
+        await send_video_file(update.message, filename, title)
         await delete_quietly(status_message)
     except Exception as exc:
         stop_event.set()
@@ -536,8 +735,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_message = "❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB)."
         elif is_tiktok_photo_url(url):
             user_message = "❌ تعذر تحميل صور TikTok. تأكد أن الرابط عام ثم جرّب مرة أخرى."
-        elif "There is no video in this post" in message:
-            user_message = "🖼️ هذا المنشور صور فقط، والبوت حالياً يحمّل الفيديوهات من Instagram."
         elif "without an audio stream" in message or "audio stream is missing" in message:
             user_message = "❌ تعذر تجهيز صوت الريل. جرّب الرابط مرة أخرى."
         else:
@@ -556,7 +753,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         clear_progress(chat_id)
         if result:
-            paths = result[0] if isinstance(result[0], list) else [result[0]]
+            if isinstance(result, dict):
+                paths = list(result.get("videos") or []) + list(result.get("photos") or [])
+            else:
+                paths = result[0] if isinstance(result[0], list) else [result[0]]
             for path in paths:
                 path.unlink(missing_ok=True)
 
