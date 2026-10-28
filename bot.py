@@ -130,7 +130,7 @@ def ensure_h264(filename, work_dir):
         return filename
     print(f"Converting {vcodec} video to H.264")
     output = work_dir / "converted_h264.mp4"
-    result = run_ffmpeg(["-threads", "2", "-i", str(filename), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)], timeout=300)
+    result = run_ffmpeg(["-i", str(filename), "-map", "0:v:0", "-map", "0:a:0?", "-vf", "scale='min(720,iw)':-2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)], timeout=300)
     if result and result.returncode == 0 and output.is_file() and output.stat().st_size > 0:
         return output
     output.unlink(missing_ok=True)
