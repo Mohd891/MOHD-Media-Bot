@@ -123,6 +123,21 @@ def video_dimensions(filename):
         return None
 
 
+def ensure_h264(filename, work_dir):
+    """Re-encode non-H.264 video (Instagram often serves VP9) so every Telegram client can play it."""
+    vcodec, _ = video_codecs(filename)
+    if vcodec in ("", "h264"):
+        return filename
+    print(f"Converting {vcodec} video to H.264")
+    output = work_dir / "converted_h264.mp4"
+    result = run_ffmpeg(["-threads", "2", "-i", str(filename), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)], timeout=300)
+    if result and result.returncode == 0 and output.is_file() and output.stat().st_size > 0:
+        return output
+    output.unlink(missing_ok=True)
+    print("H.264 conversion failed; sending original video")
+    return filename
+
+
 def faststart_mp4(filename):
     if not filename.is_file() or filename.suffix.lower() != ".mp4":
         return filename
@@ -282,7 +297,7 @@ def download_instagram(url, chat_id, job_dir):
 
     options = {
         "outtmpl": str(video_dir / "video.%(id)s.%(ext)s"),
-        "format": "bv*[vcodec^=avc1]+ba/b[ext=mp4]/b",
+        "format": "bv*[vcodec^=avc1]+ba/bv*+ba/b[ext=mp4]/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
@@ -315,7 +330,7 @@ def download_instagram(url, chat_id, job_dir):
         audio_dir.mkdir()
         audio_options = {
             "outtmpl": str(audio_dir / "audio.%(id)s.%(ext)s"),
-            "format": "ba[acodec]/bestaudio/b",
+            "format": "ba/bestaudio/b",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -338,6 +353,7 @@ def download_instagram(url, chat_id, job_dir):
 
     if not video_codecs(filename)[1]:
         raise RuntimeError("Instagram Reel was downloaded without an audio stream")
+    filename = ensure_h264(filename, job_dir)
     filename = faststart_mp4(filename)
     if not video_codecs(filename)[1]:
         raise RuntimeError("Instagram Reel audio stream is missing after processing")
@@ -520,6 +536,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_message = "❌ حجم الفيديو أكبر من الحد المسموح في Telegram (50 MB)."
         elif is_tiktok_photo_url(url):
             user_message = "❌ تعذر تحميل صور TikTok. تأكد أن الرابط عام ثم جرّب مرة أخرى."
+        elif "There is no video in this post" in message:
+            user_message = "🖼️ هذا المنشور صور فقط، والبوت حالياً يحمّل الفيديوهات من Instagram."
         elif "without an audio stream" in message or "audio stream is missing" in message:
             user_message = "❌ تعذر تجهيز صوت الريل. جرّب الرابط مرة أخرى."
         else:
