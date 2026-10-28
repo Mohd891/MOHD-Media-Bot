@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import yt_dlp
+import ytdlp_patches  # noqa: F401  (Instagram iOS-first + web fallback)
 from flask import Flask, jsonify, request
 from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -24,7 +25,8 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_TELEGRAM_SIZE = 49 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_SIZE = 10 * 1024 * 1024
-PROGRESS_UPDATE_INTERVAL = 2.0
+PROGRESS_UPDATE_INTERVAL = 3.0
+UPLOAD_TIMEOUT = 300
 DOWNLOAD_CONCURRENCY = 1
 TIKWM_API = "https://www.tikwm.com/api/"
 TIKTOK_API = "https://tdownv4.sl-bjs.workers.dev/"
@@ -395,13 +397,30 @@ def download_video(url, chat_id):
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-async def update_status_message(message, stop_event):
+async def update_status_message(message, stop_event, chat_id):
+    last_text = "⏳ <b>جاري معالجة الرابط...</b>"
     while not stop_event.is_set():
+        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+        if stop_event.is_set():
+            break
+        with progress_lock:
+            data = dict(progress_data.get(chat_id) or {})
+        percent = data.get("percent") or 0
+        text = f"⬇️ <b>جاري التحميل... {percent:.0f}%</b>" if percent else last_text
+        if text == last_text:
+            continue
         try:
-            await message.edit_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
+            await message.edit_text(text, parse_mode="HTML")
+            last_text = text
         except Exception:
             pass
-        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+
+
+async def delete_quietly(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,7 +434,7 @@ async def send_photo_album(message, paths, title):
         large_paths = [p for p in batch if p.is_file() and p.stat().st_size > MAX_TELEGRAM_PHOTO_SIZE]
         if len(photo_paths) == 1:
             with photo_paths[0].open("rb") as photo:
-                await message.reply_photo(photo=photo, caption=f"🖼️ {title[:900]}")
+                await message.reply_photo(photo=photo, caption=f"🖼️ {title[:900]}", write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
         elif photo_paths:
             handles, media = [], []
             try:
@@ -425,13 +444,13 @@ async def send_photo_album(message, paths, title):
                     media.append(InputMediaPhoto(media=handle))
                 if start == 0:
                     media[0].caption = f"🖼️ {title[:900]}"
-                await message.reply_media_group(media=media)
+                await message.reply_media_group(media=media, write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
             finally:
                 for handle in handles:
                     handle.close()
         for path in large_paths:
             with path.open("rb") as photo:
-                await message.reply_document(document=photo, caption="🖼️ صورة من TikTok Photo Mode")
+                await message.reply_document(document=photo, caption="🖼️ صورة من TikTok Photo Mode", write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -454,7 +473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     status_message = await update.message.reply_text("⏳ <b>جاري معالجة الرابط...</b>", parse_mode="HTML")
     stop_event = threading.Event()
-    progress_task = asyncio.create_task(update_status_message(status_message, stop_event))
+    progress_task = asyncio.create_task(update_status_message(status_message, stop_event, chat_id))
     result = None
     try:
         async with download_semaphore:
@@ -468,6 +487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress_task
         if isinstance(result[0], list):
             await send_photo_album(update.message, result[0], result[1])
+            await delete_quietly(status_message)
             return
         filename, title = result
         if not filename or not filename.is_file():
@@ -479,7 +499,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dimensions:
             print(f"Sending video dimensions: {width}x{height}")
         with filename.open("rb") as video:
-            await update.message.reply_video(video=video, caption=f"🎬 {title[:900]}", width=width, height=height, supports_streaming=True)
+            await update.message.reply_video(video=video, caption=f"🎬 {title[:900]}", width=width, height=height, supports_streaming=True, write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
+        await delete_quietly(status_message)
     except Exception as exc:
         stop_event.set()
         try:
@@ -518,7 +539,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def create_application():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not configured")
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return application
@@ -541,7 +562,10 @@ def bot_loop_runner():
         bot_loop.run_until_complete(telegram_application.bot.set_webhook(**kwargs))
         print(f"MOHD Media Bot is running: {webhook_url}")
     else:
-        print("MOHD Media Bot is running without RENDER_EXTERNAL_URL")
+        # Local run (no public URL): drop any old webhook and use polling instead.
+        bot_loop.run_until_complete(telegram_application.bot.delete_webhook())
+        bot_loop.run_until_complete(telegram_application.updater.start_polling())
+        print("MOHD Media Bot is running locally with polling")
     bot_loop.run_forever()
 
 
