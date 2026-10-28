@@ -1,4 +1,4 @@
 python-telegram-bot==22.8
-yt-dlp>=2026.8.19
+yt-dlp==2026.8.19
 curl-cffi==0.15.0
 Flask==3.1.2
