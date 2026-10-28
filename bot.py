@@ -16,7 +16,14 @@ from flask import Flask, jsonify, request
 from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+import sys
+
+# Show print() output in Render logs immediately (stdout is buffered otherwise).
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 TOKEN = os.getenv("BOT_TOKEN")
+KEEP_AWAKE_INTERVAL = int(os.getenv("KEEP_AWAKE_INTERVAL", "600"))
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "telegram").strip("/")
 EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -588,6 +595,21 @@ def webhook():
         return jsonify({"ok": False}), 500
 
 
+def keep_awake():
+    """Ping our own public URL so Render's free plan doesn't put the bot to sleep."""
+    import time
+    while True:
+        time.sleep(KEEP_AWAKE_INTERVAL)
+        try:
+            with urlopen(Request(f"{EXTERNAL_URL}/", headers={"User-Agent": "MOHD-keep-awake"}), timeout=30) as response:
+                response.read()
+        except Exception as exc:
+            print(f"Keep-awake ping failed: {exc!r}")
+
+
 if __name__ == "__main__":
     threading.Thread(target=bot_loop_runner, daemon=True).start()
+    if EXTERNAL_URL and KEEP_AWAKE_INTERVAL > 0:
+        threading.Thread(target=keep_awake, daemon=True).start()
+        print(f"Keep-awake ping every {KEEP_AWAKE_INTERVAL}s")
     app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
